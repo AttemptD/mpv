@@ -8334,6 +8334,11 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         mpctx->demuxer_changed = true;
 
     if (flags & UPDATE_AD && mpctx->ao_chain) {
+        // Replacing compressed/native audio with PCM must refill from the
+        // audible playhead, not from packets several seconds ahead in the AO.
+        if (mpctx->demuxer && mpctx->demuxer->seekable &&
+            mpctx->playback_pts != MP_NOPTS_VALUE)
+            issue_refresh_seek(mpctx, MPSEEK_EXACT);
         uninit_audio_chain(mpctx);
         reinit_audio_chain(mpctx);
     }

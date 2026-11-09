@@ -77,6 +77,8 @@ struct curl_open_args {
 
 struct curl_opts {
     bool enabled;
+    bool reuse_redirects;
+    bool cache_prefix;
     int http_version;
     int max_redirects;
     int max_retries;
@@ -99,6 +101,8 @@ struct curl_opts {
 const struct m_sub_options curl_conf = {
     .opts = (const struct m_option[]) {
         {"enabled", OPT_BOOL(enabled)},
+        {"reuse-redirects", OPT_BOOL(reuse_redirects)},
+        {"cache-prefix", OPT_BOOL(cache_prefix)},
         {"http-version", OPT_CHOICE(http_version,
             {"auto", CURL_HTTP_VERSION_NONE},
             {"1.0", CURL_HTTP_VERSION_1_0},
@@ -122,6 +126,8 @@ const struct m_sub_options curl_conf = {
 #ifdef CURL_BY_DEFAULT
         .enabled = true,
 #endif
+        .reuse_redirects = true,
+        .cache_prefix = true,
         .http_version = CURL_HTTP_VERSION_NONE,
         .max_redirects = 16,
         .max_retries = 5,
@@ -163,6 +169,9 @@ struct priv {
     struct curl_slist *headers;
     char *url;
     const char *effective_url;
+    char *redirect_url;
+    bool can_reuse_redirect;
+    bool using_redirect;
     const struct curl_scheme *scheme;
 
     // Stream parameters
@@ -174,6 +183,10 @@ struct priv {
     uint64_t request_start;    // absolute byte position of next request
     uint64_t request_received; // bytes received in the current request
     uint64_t request_end;      // exclusive byte cap (0 = unbounded)
+    bool response_validated;  // final response belongs to this request's offset
+    CURLcode response_error;
+    double last_data_time;    // excludes time paused by a full consumer buffer
+    bool timed_out;
     int retry_count;           // consecutive failed attempts at request_start
     bool active;               // handle is currently active in the multi
     bool finished;             // current request has reached EOF
@@ -186,6 +199,9 @@ struct priv {
     mp_mutex mtx;
     mp_cond cond;
     uint8_t *buffer;
+    uint8_t *prefix;
+    size_t prefix_size, prefix_capacity;
+    int64_t prefix_position; // consumer-only cursor; -1 reads the normal ring
     size_t buffer_size;
     size_t head, tail, count;
     bool paused;         // write callback paused due to a full buffer
@@ -239,6 +255,7 @@ static void run_cmd(void *arg)
         MP_TRACE(c->p, "resuming curl transfer\n");
         c->p->paused = false;
         mp_mutex_unlock(&c->p->mtx);
+        c->p->last_data_time = mp_time_sec();
         curl_easy_pause(c->p->curl, CURLPAUSE_CONT);
         break;
     case CMD_SEEK:
@@ -382,12 +399,13 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     // header_callback validated the response and logged any error status,
     // we don't care about error body.
-    if (!p->stream_ok)
+    if (!p->response_validated)
         return CURL_WRITEFUNC_ERROR;
 
     if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
         return CURL_WRITEFUNC_ERROR;
 
+    p->last_data_time = mp_time_sec();
     mp_mutex_lock(&p->mtx);
 
     if (p->buffer_size - p->count < bytes) {
@@ -398,6 +416,18 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
         return CURL_WRITEFUNC_PAUSE;
     }
 
+    // Keep a bounded, contiguous beginning of this stream. Matroska reads tail
+    // metadata and then returns to its first cluster before the history seek.
+    // Those already received bytes need not make another HTTP round trip.
+    uint64_t offset = p->request_start + p->request_received;
+    if (p->prefix_capacity && p->seekable && !mp_icy_active(p->icy) &&
+        offset <= p->prefix_size && offset + bytes > p->prefix_size)
+    {
+        size_t skip = p->prefix_size - offset;
+        size_t copy = MPMIN(bytes - skip, p->prefix_capacity - p->prefix_size);
+        memcpy(p->prefix + p->prefix_size, ptr + skip, copy);
+        p->prefix_size += copy;
+    }
     mp_icy_process(p->icy, ptr, bytes, ring_write, p);
 
     p->paused = false;
@@ -413,7 +443,22 @@ static int xferinfo_callback(void *userdata, curl_off_t dl_total, curl_off_t dl_
                              curl_off_t ul_total, curl_off_t ul_now)
 {
     struct priv *p = userdata;
-    return atomic_load_explicit(&p->aborted, memory_order_relaxed);
+    if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
+        return 1;
+
+    double now = mp_time_sec();
+    mp_mutex_lock(&p->mtx);
+    bool paused = p->paused;
+    mp_mutex_unlock(&p->mtx);
+    if (paused) {
+        p->last_data_time = now;
+    } else if (p->net_opts->timeout > 0 &&
+               now - p->last_data_time >= p->net_opts->timeout)
+    {
+        p->timed_out = true;
+        return 1;
+    }
+    return 0;
 }
 
 static const char *header_value(CURL *c, const char *name)
@@ -464,6 +509,41 @@ static void finalize_probe(struct priv *p)
     mp_mutex_unlock(&p->mtx);
 }
 
+static bool url_has_credentials(const char *url)
+{
+    CURLU *parsed = curl_url();
+    char *user = NULL, *password = NULL;
+    bool unsafe = !parsed || curl_url_set(parsed, CURLUPART_URL, url, 0) != CURLUE_OK;
+    if (!unsafe) {
+        unsafe = curl_url_get(parsed, CURLUPART_USER, &user, 0) == CURLUE_OK ||
+                 curl_url_get(parsed, CURLUPART_PASSWORD, &password, 0) == CURLUE_OK;
+    }
+    curl_free(user);
+    curl_free(password);
+    if (parsed)
+        curl_url_cleanup(parsed);
+    return unsafe;
+}
+
+// Reuse only a validated destination within this open stream. Explicit auth,
+// cookies and client certificates retain libcurl's original redirect scoping.
+static void remember_redirect(struct priv *p)
+{
+    if (!p->can_reuse_redirect || mp_icy_active(p->icy))
+        return;
+    char *url = NULL;
+    if (curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &url) != CURLE_OK ||
+        !url || !strcmp(url, p->url))
+        return;
+    const struct curl_scheme *scheme = curl_scheme_lookup(bstr0(url));
+    if (!scheme || scheme->proto != MP_CURL_PROTO_HTTP || url_has_credentials(url))
+        return;
+    // getinfo returns borrowed memory that a subsequent transfer can replace.
+    char *copy = talloc_strdup(p, url);
+    talloc_free(p->redirect_url);
+    p->redirect_url = copy;
+}
+
 // Empty line is the end of the header. Skip intermediate 1xx and 3xx responses,
 // we care about the final one.
 static void probe_http(struct priv *p, struct bstr line)
@@ -473,6 +553,7 @@ static void probe_http(struct priv *p, struct bstr line)
         // 1xx/3xx responses don't leak ICY metadata into the final one.
         mp_mutex_lock(&p->mtx);
         if (bstr_startswith0(line, "HTTP/")) {
+            p->response_validated = false;
             mp_icy_reset(p->icy);
         } else {
             mp_icy_add_header(p->icy, line);
@@ -488,23 +569,36 @@ static void probe_http(struct priv *p, struct bstr line)
 
     if (!is_http_success(resp)) {
         MP_ERR(p, "HTTP error %ld\n", resp);
+        p->response_error = CURLE_HTTP_RETURNED_ERROR;
         goto done;
     }
 
     int64_t range_start, range_total;
     parse_content_range(p->curl, &range_start, &range_total);
+    const char *ce = header_value(p->curl, "Content-Encoding");
+    bool compressed = ce && ce[0] && strcasecmp(ce, "identity") != 0;
 
-    // A request with an explicit start offset must be honored by the server
-    if (p->start_offset > 0 && range_start != p->start_offset) {
-        MP_ERR(p, "Server ignored range request at offset %" PRId64 "\n",
-               p->start_offset);
+    // Validate every response, including seeks, retries and chunk continuations.
+    // A normal 200 at offset zero remains valid for non-seekable servers.
+    if ((p->request_start > 0 && (resp != 206 || compressed)) ||
+        (resp == 206 && (range_start < 0 ||
+                        (uint64_t)range_start != p->request_start)) ||
+        (p->using_redirect && p->content_size > 0 && range_total > 0 &&
+         p->content_size != range_total))
+    {
+        MP_ERR(p, "Server ignored range request at offset %" PRIu64 "\n",
+               p->request_start);
+        p->response_error = CURLE_RANGE_ERROR;
         goto done;
     }
 
+    p->response_validated = true;
+    remember_redirect(p);
+    if (p->probed)
+        return;
+
     // Compressed responses are byte-addressed in the encoded representation,
     // which our caller can't translate, so they are non-seekable.
-    const char *ce = header_value(p->curl, "Content-Encoding");
-    bool compressed = ce && ce[0] && strcasecmp(ce, "identity") != 0;
     const char *ar = header_value(p->curl, "Accept-Ranges");
     bool accept_ranges = ar && strcasecmp(ar, "bytes") == 0;
 
@@ -542,6 +636,10 @@ static void probe_ftp(struct priv *p, struct bstr line)
     if (!bstr_equals0(code, "150") && !bstr_equals0(code, "125"))
         return;
 
+    p->response_validated = true;
+    if (p->probed)
+        return;
+
     curl_off_t cl = -1;
     if (curl_easy_getinfo(p->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
                           &cl) == CURLE_OK && cl >= 0)
@@ -558,9 +656,7 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
     struct priv *p = userdata;
     size_t bytes = size * nitems;
 
-    if (p->probed)
-        return bytes;
-
+    p->last_data_time = mp_time_sec();
     struct bstr line = bstr_strip_linebreaks((bstr){buffer, bytes});
     switch (p->scheme->proto) {
     case MP_CURL_PROTO_HTTP:
@@ -573,7 +669,7 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
         break;
     }
 
-    return bytes;
+    return p->response_error == CURLE_OK ? bytes : 0;
 }
 
 static int debug_callback(CURL *handle, curl_infotype type, char *data, size_t size,
@@ -657,7 +753,15 @@ static void start_request(struct priv *p)
         curl_easy_setopt(p->curl, CURLOPT_RANGE, NULL);
     }
 
+    p->using_redirect = p->redirect_url != NULL;
+    if (p->scheme->proto == MP_CURL_PROTO_HTTP)
+        MP_TRACE(p, "starting HTTP range request at %" PRIu64 "\n", start);
+    curl_easy_setopt(p->curl, CURLOPT_URL, p->using_redirect ? p->redirect_url : p->url);
     p->request_received = 0;
+    p->response_validated = false;
+    p->response_error = CURLE_OK;
+    p->last_data_time = mp_time_sec();
+    p->timed_out = false;
     p->active = true;
     curl_multi_add_handle(p->ctx->multi, p->curl);
 }
@@ -679,6 +783,12 @@ static void log_curl_error(struct priv *p, const char *what, CURLcode code)
 static void on_done(struct priv *p, CURLcode code)
 {
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
+    if (!aborted && p->response_error != CURLE_OK)
+        code = p->response_error;
+    else if (!aborted && p->timed_out)
+        code = CURLE_OPERATION_TIMEDOUT;
+    else if (!aborted && code == CURLE_OK && !p->response_validated)
+        code = CURLE_HTTP_RETURNED_ERROR;
 
     if (!p->probed) {
         // Connection died before any headers arrived.
@@ -688,6 +798,20 @@ static void on_done(struct priv *p, CURLcode code)
         p->probed = true;
         mp_cond_broadcast(&p->cond);
         mp_mutex_unlock(&p->mtx);
+        return;
+    }
+
+    // A signed CDN URL may expire. Re-resolve through the authenticated service
+    // before returning an error, without admitting an error body or wrong range.
+    if (!aborted && p->using_redirect && !p->response_validated &&
+        !p->request_received && p->retry_count < p->opts->max_retries &&
+        (code == CURLE_HTTP_RETURNED_ERROR || code == CURLE_RANGE_ERROR))
+    {
+        p->retry_count++;
+        talloc_free(p->redirect_url);
+        p->redirect_url = NULL;
+        MP_VERBOSE(p, "Refreshing redirected stream address at offset %" PRIu64 "\n", p->request_start);
+        start_request(p);
         return;
     }
 
@@ -770,6 +894,13 @@ static struct curl_slist *build_header_list(struct priv *p)
 static void setup_curl(struct priv *p)
 {
     CURL *c = p->curl;
+
+    p->can_reuse_redirect = p->opts->reuse_redirects &&
+        p->scheme->proto == MP_CURL_PROTO_HTTP &&
+        !p->net_opts->cookies_enabled &&
+        !(p->net_opts->http_header_fields && p->net_opts->http_header_fields[0]) &&
+        !p->net_opts->tls_cert_file && !p->net_opts->tls_key_file &&
+        !url_has_credentials(p->url);
 
     curl_easy_setopt(c, CURLOPT_URL, p->url);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
@@ -854,6 +985,21 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     if (max_len <= 0)
         return 0;
 
+    if (p->prefix_position >= 0) {
+        mp_mutex_lock(&p->mtx);
+        size_t copy = MPMIN((size_t)max_len, p->prefix_size - p->prefix_position);
+        memcpy(buffer, p->prefix + p->prefix_position, copy);
+        p->prefix_position += copy;
+        int64_t next = p->prefix_position;
+        mp_mutex_unlock(&p->mtx);
+        if (copy)
+            return copy;
+        // Open the continuation only if the demuxer actually consumes the
+        // entire cached prefix. Its initial history seek usually happens first.
+        p->prefix_position = -1;
+        cmd_sync(p, CMD_SEEK, next, true);
+    }
+
     mp_mutex_lock(&p->mtx);
 
     while (p->count == 0 && !p->stream_eof && !p->stream_error &&
@@ -887,6 +1033,16 @@ static int curl_seek(struct stream *s, int64_t pos)
     struct priv *p = s->priv;
     if (pos < 0)
         return 0;
+    p->prefix_position = -1;
+    mp_mutex_lock(&p->mtx);
+    bool cached = (uint64_t)pos < p->prefix_size;
+    mp_mutex_unlock(&p->mtx);
+    if (cached) {
+        cmd_sync(p, CMD_REMOVE, 0, false);
+        p->prefix_position = pos;
+        MP_TRACE(p, "seeking within received prefix to %" PRId64 "\n", pos);
+        return 1;
+    }
     cmd_sync(p, CMD_SEEK, pos, true);
     return 1;
 }
@@ -971,6 +1127,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     p->content_size = -1;
     p->buffer_size = p->opts->buffer_size;
     p->buffer = talloc_size(p, p->buffer_size);
+    p->prefix_position = -1;
     p->icy = mp_icy_new(p);
 
     if (args->special_arg) {
@@ -981,6 +1138,13 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         }
         if (oa->end_offset > 0)
             p->request_end = oa->end_offset;
+    }
+
+    if (p->opts->cache_prefix && p->scheme->proto == MP_CURL_PROTO_HTTP && !p->start_offset) {
+        p->prefix_capacity = MPMIN(p->buffer_size, 1 << 20);
+        if (p->request_end)
+            p->prefix_capacity = MPMIN(p->prefix_capacity, p->request_end);
+        p->prefix = talloc_size(p, p->prefix_capacity);
     }
 
     mp_mutex_init(&p->mtx);
@@ -1014,7 +1178,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
 
     const char *effective_url = NULL;
     curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective_url);
-    p->effective_url = effective_url ? effective_url : p->url;
+    p->effective_url = talloc_strdup(p, effective_url ? effective_url : p->url);
 
     s->seekable = p->seekable;
     s->is_network = true;

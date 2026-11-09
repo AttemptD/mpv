@@ -2,17 +2,21 @@
 #include "libmpv.h"
 #include "sub/osd.h"
 #include "video/sws_utils.h"
+#include "video/mp_image_pool.h"
+#include "libmpv_sw_color.h"
 
 struct priv {
     struct libmpv_gpu_context *context;
 
     struct mp_sws_context *sws;
+    struct mp_image_pool *download_pool;
     struct osd_state *osd;
 
     struct mp_image_params src_params, dst_params;
     struct mp_rect src_rc, dst_rc;
     struct mp_osd_res osd_rc;
     bool anything_changed;
+    struct sw_color color;
 };
 
 static int init(struct render_backend *ctx, mpv_render_param *params)
@@ -28,6 +32,7 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
         return MPV_ERROR_NOT_IMPLEMENTED;
 
     p->sws = mp_sws_alloc(p);
+    p->download_pool = mp_image_pool_new(p);
     mp_sws_enable_cmdline_opts(p->sws, ctx->global);
 
     p->anything_changed = true;
@@ -93,7 +98,7 @@ static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
     return 0;
 }
 
-static int render(struct render_backend *ctx, mpv_render_param *params,
+static int render_frame(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame)
 {
     struct priv *p = ctx->priv;
@@ -102,6 +107,20 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     char *fmt = get_mpv_render_param(params, MPV_RENDER_PARAM_SW_FORMAT, NULL);
     size_t *stride = get_mpv_render_param(params, MPV_RENDER_PARAM_SW_STRIDE, NULL);
     void *ptr = get_mpv_render_param(params, MPV_RENDER_PARAM_SW_POINTER, NULL);
+    struct mpv_render_sw_p010 *hdr = get_mpv_render_param(params, MPV_RENDER_PARAM_SW_P010, NULL);
+    if (sz && hdr) {
+        struct mpv_render_dovi_status *status = get_mpv_render_param(params, MPV_RENDER_PARAM_DOVI_STATUS, NULL);
+        if (status) *status = (struct mpv_render_dovi_status){0};
+        const bool formats[SUBBITMAP_COUNT] = {
+            [SUBBITMAP_LIBASS] = true, [SUBBITMAP_BGRA] = true,
+        };
+        struct sub_bitmap_list *captions = p->osd && frame->current
+            ? osd_render(p->osd, p->osd_rc, frame->current->pts, OSD_DRAW_SUB_ONLY, formats) : NULL;
+        const float *overlay = sw_color_subtitles(&p->color, ctx, captions, sz[0], sz[1]);
+        int result = sw_color_render_p010(&p->color, ctx, sz[0], sz[1], hdr, frame->current, status, overlay);
+        talloc_free(captions);
+        return result;
+    }
 
     if (!sz || !fmt || !stride || !ptr)
         return MPV_ERROR_INVALID_PARAMETER;
@@ -175,7 +194,12 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         struct mp_image dst = wrap_img;
         mp_image_crop_rc(&dst, p->dst_rc);
 
-        if (mp_sws_scale(p->sws, &dst, &src) < 0) {
+        struct mpv_render_dovi_status *status = get_mpv_render_param(params, MPV_RENDER_PARAM_DOVI_STATUS, NULL);
+        if (status) *status = (struct mpv_render_dovi_status){0};
+        int result = sw_color_is_hdr(&src)
+            ? sw_color_render(&p->color, ctx, &dst, &src, status, NULL, NULL)
+            : mp_sws_scale(p->sws, &dst, &src);
+        if (result < 0) {
             mp_image_clear(&wrap_img, 0, 0, wrap_img.w, wrap_img.h);
             return MPV_ERROR_GENERIC;
         }
@@ -189,9 +213,55 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     return 0;
 }
 
+// The GPU VO may keep direct VideoToolbox decoding active while its frames
+// are submitted to background-safe sample buffers. Download only this frame;
+// changing hwdec/vo here would flush decoding and seek the media again.
+static int render(struct render_backend *ctx, mpv_render_param *params,
+                  struct vo_frame *frame)
+{
+    struct priv *p = ctx->priv;
+    struct mp_image *img = frame->current;
+    struct mp_image *downloaded = NULL;
+    struct vo_frame software_frame;
+    // img->fmt describes the underlying software layout for hardware frames
+    // (e.g. P010), so its flags do not identify the opaque hardware surface.
+    if (img && (IMGFMT_IS_HWACCEL(img->imgfmt) ||
+                (img->enhancement_layer &&
+                 IMGFMT_IS_HWACCEL(img->enhancement_layer->imgfmt))))
+    {
+        downloaded = IMGFMT_IS_HWACCEL(img->imgfmt)
+            ? mp_image_hw_download(img, p->download_pool) : mp_image_new_ref(img);
+        if (!downloaded)
+            return MPV_ERROR_UNSUPPORTED;
+        if (img->enhancement_layer &&
+            IMGFMT_IS_HWACCEL(img->enhancement_layer->imgfmt))
+        {
+            struct mp_image *el = mp_image_hw_download(img->enhancement_layer,
+                                                       p->download_pool);
+            if (!el) {
+                talloc_free(downloaded);
+                return MPV_ERROR_UNSUPPORTED;
+            }
+            mp_image_unrefp(&downloaded->enhancement_layer);
+            downloaded->enhancement_layer = el;
+        }
+        software_frame = *frame;
+        software_frame.current = downloaded;
+        frame = &software_frame;
+    }
+    if (frame->current &&
+        !mp_image_params_equal(&p->src_params, &frame->current->params))
+        reconfig(ctx, &frame->current->params);
+    int result = render_frame(ctx, params, frame);
+    talloc_free(downloaded);
+    return result;
+}
+
 static void destroy(struct render_backend *ctx)
 {
-    // nop
+    struct priv *p = ctx->priv;
+    mp_image_unrefp(&p->color.bl);
+    mp_image_unrefp(&p->color.el);
 }
 
 const struct render_backend_fns render_backend_sw = {

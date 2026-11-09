@@ -422,7 +422,108 @@ typedef enum mpv_render_param_type {
      * See MPV_RENDER_PARAM_SW_STRIDE for alignment requirements.
      */
     MPV_RENDER_PARAM_SW_POINTER = 20,
+    /**
+     * The name of the render backend to use. Valid for mpv_render_context_create().
+     *
+     * Type: char*
+     *
+     * Defined backends:
+     *   "gpu" (default)
+     *   "gpu-next"
+     */
+    MPV_RENDER_PARAM_BACKEND = 21,
+    /**
+     * Afuse iOS gpu-next target: mpv_render_target_color*. Passed per render.
+     * Omission preserves sRGB output. Linear BT.2020 uses RGBA16F with
+     * 1.0 = 203 cd/m2, for a CAMetalLayer with matching EDR metadata.
+     */
+    MPV_RENDER_PARAM_TARGET_COLOR = 22,
+    /** Afuse gpu-next: writes mpv_render_dovi_status after a successful render. */
+    MPV_RENDER_PARAM_DOVI_STATUS = 23,
+    /** Afuse CPU HDR output: mpv_render_sw_p010*, with MPV_RENDER_PARAM_SW_SIZE.
+     * Preserves BT.2020/PQ luminance in a 10-bit video-range bi-planar buffer.
+     */
+    MPV_RENDER_PARAM_SW_P010 = 24,
+    /** Afuse Apple extension: mpv_render_apple_frame, see below. */
+    MPV_RENDER_PARAM_APPLE_FRAME = 25,
+    /** Afuse P7 reconstruction input, mpv_render_apple_p7_frame*. No frame is
+     * consumed if validation or metadata conversion fails. Requires the same
+     * mapping permission as APPLE_FRAME. The host MUST compose before display. */
+    MPV_RENDER_PARAM_APPLE_P7_FRAME = 26,
 } mpv_render_param_type;
+
+typedef struct mpv_render_target_color {
+    int linear_bt2020;
+    float peak_nits;
+} mpv_render_target_color;
+
+/** Subtitle pixels are borrowed until release(owner). BGRA is premultiplied;
+ *  ASS masks use color RRGGBBAA with inverted ASS alpha. Coordinates are top-left.
+ */
+typedef struct mpv_apple_subtitle_part {
+    const void *pixels;
+    int stride, w, h, x, y, dw, dh;
+    int ass_mask;
+    uint32_t color;
+} mpv_apple_subtitle_part;
+
+/** Optional native presentation on the SAME libmpv clock.
+ *  Input: viewport_w/h. All other fields must be zero.
+ *  NOT_IMPLEMENTED means no native frame; no frame was consumed, so render via
+ *  the existing backend. Success consumes one frame, just like a GL render.
+ *  Original decoder CVPixelBuffer / source CMVideoFormatDescription are borrowed
+ *  until release(owner). The host must retain them before releasing the handle.
+ *  Do not modify pixels or remove their opaque Dolby attachments. Subtitles must
+ *  be composited by the host in a separate SDR overlay. Report swap as usual.
+ */
+typedef struct mpv_render_apple_frame {
+    int viewport_w, viewport_h;
+    void *pixel_buffer, *source_format;
+    int src_x, src_y, src_w, src_h;
+    int dst_x, dst_y, dst_w, dst_h;
+    int rotation;
+    double pts;
+    int64_t subtitle_change_id;
+    mpv_apple_subtitle_part *subtitles;
+    int subtitle_count;
+    void *owner;
+    void (*release)(void *owner);
+} mpv_render_apple_frame;
+
+/* Scalar-only layout shared with Metal; no SIMD padding or pointer fields. */
+typedef struct mpv_apple_p7_curve {
+    float count, pivots[9], method[8], polynomial[8][3];
+    float order[8], constant[8], mmr[8][3][7];
+} mpv_apple_p7_curve;
+typedef struct mpv_apple_p7_params {
+    float base_scale, enhancement_texture_scale, vdr_scale, residual;
+    /* offset, slope in VDR codes / 2, threshold in VDR codes, max VDR codes */
+    float nlq[3][4];
+    mpv_apple_p7_curve curves[3];
+} mpv_apple_p7_params;
+typedef struct mpv_render_apple_p7_frame {
+    mpv_render_apple_frame frame;
+    void *enhancement_buffer;
+    const uint8_t *rpu;
+    int rpu_size;
+    mpv_apple_p7_params params;
+} mpv_render_apple_p7_frame;
+
+typedef struct mpv_render_dovi_status {
+    int mapped;
+    int enhancement_layer;
+    int residual;
+    int base_bit_depth;
+    int enhancement_bit_depth;
+} mpv_render_dovi_status;
+
+typedef struct mpv_render_sw_p010 {
+    void *planes[2];
+    size_t strides[2];
+    float peak_nits;
+    float max_cll;
+    float max_fall;
+} mpv_render_sw_p010;
 
 /**
  * For backwards compatibility with the old naming of

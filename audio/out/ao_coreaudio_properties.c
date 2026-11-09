@@ -19,6 +19,8 @@
  * Abstractions on the CoreAudio API to make property setting/getting suck less
 */
 
+#include <TargetConditionals.h>
+#if !TARGET_OS_IPHONE
 #include "audio/out/ao_coreaudio_properties.h"
 #include "audio/out/ao_coreaudio_utils.h"
 #include "mpv_talloc.h"
@@ -101,3 +103,5 @@ Boolean ca_settable(AudioObjectID id, ca_scope scope, ca_sel selector,
 
     return AudioObjectIsPropertySettable(id, &p_addr, data);
 }
+
+#endif

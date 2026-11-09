@@ -416,11 +416,11 @@ void update_demuxer_properties(struct MPContext *mpctx)
 // Enables or disables the stream for the given track, according to
 // track->selected.
 // With refresh_only=true, refreshes the stream if it's enabled.
-void reselect_demux_stream(struct MPContext *mpctx, struct track *track,
+bool reselect_demux_stream(struct MPContext *mpctx, struct track *track,
                            bool refresh_only)
 {
     if (!track->stream)
-        return;
+        return false;
     double pts = get_current_time(mpctx);
     if (pts != MP_NOPTS_VALUE) {
         pts += get_track_seek_offset(mpctx, track);
@@ -430,7 +430,8 @@ void reselect_demux_stream(struct MPContext *mpctx, struct track *track,
     if (refresh_only)
         demuxer_refresh_track(track->demuxer, track->stream, pts);
     else
-        demuxer_select_track(track->demuxer, track->stream, pts, track->selected);
+        return demuxer_select_track(track->demuxer, track->stream, pts, track->selected);
+    return false;
 }
 
 static void enable_demux_thread(struct MPContext *mpctx, struct demuxer *demux)
@@ -816,15 +817,27 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
 
     mpctx->current_track[order][type] = track;
 
+    bool refresh_required = false;
     if (track) {
         track->selected = true;
-        reselect_demux_stream(mpctx, track, false);
+        refresh_required = reselect_demux_stream(mpctx, track, false);
     }
 
     if (type == STREAM_VIDEO && order == 0) {
         reinit_video_chain(mpctx);
     } else if (type == STREAM_AUDIO && order == 0) {
         reinit_audio_chain(mpctx);
+        if (refresh_required && track && track->demuxer == mpctx->demuxer &&
+            mpctx->demuxer->seekable && mpctx->playback_initialized &&
+            get_current_time(mpctx) != MP_NOPTS_VALUE)
+        {
+            MP_VERBOSE(mpctx, "Audio track refresh requires playback resync.\n");
+            // Cached ranges still describe the previous track selection.
+            // Without invalidation, the refresh can seek within a video-only
+            // range and leave the new audio at the prefetch position again.
+            demux_flush(mpctx->demuxer);
+            issue_refresh_seek(mpctx, MPSEEK_EXACT);
+        }
     } else if (type == STREAM_SUB && order >= 0 && order <= 2) {
         reinit_sub(mpctx, track);
     }
@@ -1602,8 +1615,17 @@ void update_vo_chain_el_pair(struct MPContext *mpctx)
     if (!mpctx->vo_chain || !mpctx->vo_chain->filter)
         return;
     struct track *track = mpctx->current_track[0][STREAM_VIDEO];
-    mp_output_chain_set_el_stream(mpctx->vo_chain->filter,
-        track ? sh_stream_dependent_sibling(track->stream) : NULL);
+    struct sh_stream *el = track ? sh_stream_dependent_sibling(track->stream) : NULL;
+    // libmpv's iOS renderer must opt in before any enhancement decoder starts.
+    if (el && !mpctx->opts->vo->libmpv_dovi_mapping &&
+        mpctx->video_out && !strcmp(mpctx->video_out->driver->name, "libmpv")) {
+        demuxer_select_track(track->demuxer, el, MP_NOPTS_VALUE, false);
+        MP_VERBOSE(mpctx, "Dolby mapping disabled: enhancement decoder not started.\n");
+        el = NULL;
+    } else if (el && mpctx->opts->vo->libmpv_dovi_mapping) {
+        demuxer_select_track(track->demuxer, el, mpctx->video_pts, true);
+    }
+    mp_output_chain_set_el_stream(mpctx->vo_chain->filter, el);
 }
 
 void update_lavfi_complex(struct MPContext *mpctx)

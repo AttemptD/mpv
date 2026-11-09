@@ -131,6 +131,9 @@ typedef struct mp_image {
     int num_ff_side_data;
     // Optional decoded enhancement-layer frame
     struct mp_image *enhancement_layer;
+    // Original Apple decoder surface. Kept only for native presentation.
+    // Separate from enhancement_layer; never used to bypass P7 composition.
+    struct mp_image *apple_native;
 } mp_image_t;
 
 struct mp_ff_side_data {

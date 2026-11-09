@@ -43,7 +43,7 @@ struct priv {
 
     bool bl_eof;
     bool el_eof;
-    bool el_seen;
+    uint64_t paired_frames;
 };
 
 static int pts_cmp(double a, double b)
@@ -58,7 +58,7 @@ static int pts_cmp(double a, double b)
 // Pull available frames from `pin` into `queue` until either no data is
 // ready or the queue is full. Sets *eof if the upstream signaled EOF.
 static void drain_pin(struct mp_filter *f, struct mp_pin *pin,
-                      struct mp_image ***queue, int *num, bool *eof)
+                      struct mp_image ***queue, int *num, bool *eof, bool order_by_pts)
 {
     while (!*eof && *num < QUEUE_MAX) {
         if (!mp_pin_out_request_data(pin))
@@ -73,6 +73,15 @@ static void drain_pin(struct mp_filter *f, struct mp_pin *pin,
             continue;
         }
         MP_TARRAY_APPEND(f->priv, *queue, *num, fr.data);
+        if (order_by_pts) {
+            for (int i = *num - 1; i > 0; i--) {
+                if ((*queue)[i]->pts == MP_NOPTS_VALUE ||
+                    (*queue)[i - 1]->pts == MP_NOPTS_VALUE ||
+                    pts_cmp((*queue)[i]->pts, (*queue)[i - 1]->pts) >= 0)
+                    break;
+                MPSWAP(struct mp_image *, (*queue)[i], (*queue)[i - 1]);
+            }
+        }
     }
 }
 
@@ -121,10 +130,8 @@ static void pair_process(struct mp_filter *f)
     struct mp_pin *in = f->ppins[0];
     struct mp_pin *out = f->ppins[1];
 
-    drain_pin(f, in, &p->bl_pending, &p->num_bl_pending, &p->bl_eof);
-    drain_pin(f, p->el_in, &p->el_pending, &p->num_el_pending, &p->el_eof);
-    if (p->num_el_pending > 0)
-        p->el_seen = true;
+    drain_pin(f, in, &p->bl_pending, &p->num_bl_pending, &p->bl_eof, false);
+    drain_pin(f, p->el_in, &p->el_pending, &p->num_el_pending, &p->el_eof, true);
 
     while (mp_pin_in_needs_data(out)) {
         if (p->num_bl_pending == 0) {
@@ -152,6 +159,10 @@ static void pair_process(struct mp_filter *f)
             struct mp_image *el = take_head(&p->el_pending, &p->num_el_pending);
             take_head(&p->bl_pending, &p->num_bl_pending);
             inherit_dovi_from_el(bl, el);
+            if (++p->paired_frames <= 4 || p->paired_frames % 120 == 0)
+                MP_VERBOSE(f, "P7 pair BL=%.6f EL=%.6f residual=%s\n", bl->pts, el->pts,
+                           bl->params.repr.dovi && bl->params.repr.dovi->nlq_active
+                           ? "active" : "zero-or-unknown");
             if (bl->params.no_enhancement_layer) {
                 talloc_free(el);
             } else {
@@ -163,9 +174,7 @@ static void pair_process(struct mp_filter *f)
 
         // No EL match for the oldest BL. Hold BL unless we have affirmative
         // evidence no EL is coming.
-        bool give_up = p->el_eof ||
-                       (p->num_el_pending > 0 && cmp > 0) ||
-                       (p->num_bl_pending >= QUEUE_MAX && p->el_seen);
+        bool give_up = p->el_eof || p->num_el_pending >= QUEUE_MAX;
         if (!give_up)
             return;
 
@@ -191,7 +200,7 @@ static void pair_reset(struct mp_filter *f)
         pop_head(&p->el_pending, &p->num_el_pending);
     p->bl_eof = false;
     p->el_eof = false;
-    p->el_seen = false;
+    p->paired_frames = 0;
 }
 
 static void pair_destroy(struct mp_filter *f)

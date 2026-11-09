@@ -47,6 +47,8 @@ enum af_format {
     AF_FORMAT_S_EAC3,
     AF_FORMAT_S_MP3,
     AF_FORMAT_S_TRUEHD,
+    // Private duration-preserving Apple APAC carrier; never send to HDMI/SPDIF.
+    AF_FORMAT_S_APAC,
 
     AF_FORMAT_COUNT
 };

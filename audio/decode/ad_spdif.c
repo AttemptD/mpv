@@ -306,7 +306,7 @@ static int init_filter(struct mp_filter *da)
     }
     case AV_CODEC_ID_EAC3:
         sample_format                   = AF_FORMAT_S_EAC3;
-        samplerate                      = 192000;
+        samplerate                      = (c_rate > 0 ? c_rate : 48000) * 4;
         num_channels                    = 2;
         break;
     case AV_CODEC_ID_MP3:

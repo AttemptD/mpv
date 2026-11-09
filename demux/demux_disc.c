@@ -42,6 +42,7 @@ struct priv {
     double base_time;   // playback display start time of current segment
     double base_dts;    // packet DTS that maps to base_time
     double last_dts;    // DTS of previously demuxed packet
+    double seek_base_time; // title time captured before buffered reads advance it
     bool seek_reinit;   // needs reinit after seek
 
     bool is_dvd, is_cdda;
@@ -207,6 +208,13 @@ static void d_seek(demuxer_t *demuxer, double seek_pts, int flags)
     double seek_arg[] = {seek_pts, flags};
     stream_control(demuxer->stream, STREAM_CTRL_SEEK_TO_TIME, seek_arg);
 
+    // Capture the actual title position immediately after navigation. Once
+    // lavf reads ahead, the disc cursor can be seconds past the first packet.
+    double base = seek_pts;
+    if (stream_control(demuxer->stream, STREAM_CTRL_GET_CURRENT_TIME, &base) < 1)
+        base = seek_pts;
+    p->seek_base_time = base;
+
     if (p->slave->desc->drop_buffers)
         p->slave->desc->drop_buffers(p->slave);
 
@@ -217,9 +225,9 @@ static void reset_pts(demuxer_t *demuxer)
 {
     struct priv *p = demuxer->priv;
 
-    double base;
-    if (stream_control(demuxer->stream, STREAM_CTRL_GET_CURRENT_TIME, &base) < 1)
-        base = 0;
+    // A newly opened title starts at zero. After a seek, use the navigation
+    // anchor saved before any prefetch, not the current physical read cursor.
+    double base = p->seek_base_time;
 
     MP_VERBOSE(demuxer, "reset to time: %f\n", base);
 
@@ -358,7 +366,13 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
         sname = cur->info->name;
 
     p->is_cdda = strcmp(sname, "cdda") == 0;
-    p->is_dvd = strcmp(sname, "dvdnav") == 0 ||
+    // A DVD ISO may have entered through bd://longest before the image
+    // probe handed it to dvdnav. Its original backend name is still "bd".
+    // Detect capabilities so DVD subtitle palettes, language and aspect
+    // handling are retained for that automatic fallback as well.
+    struct stream_dvd_info_req dvd_info;
+    p->is_dvd = stream_control(cur, STREAM_CTRL_GET_DVD_INFO, &dvd_info) ==
+                STREAM_OK || strcmp(sname, "dvdnav") == 0 ||
                 strcmp(sname, "ifo_dvdnav") == 0;
 
     if (p->is_cdda)
@@ -371,8 +385,8 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
         talloc_free(t);
     }
 
-    // Initialize the playback time. We need to read _some_ data to get the
-    // correct stream-layer time (at least with libdvdnav).
+    // Prime DVD navigation metadata before opening the packet demuxer. This
+    // read may advance the disc cursor; it must not shift the title's zero.
     stream_read_peek(demuxer->stream, &(char){0}, 1);
     reset_pts(demuxer);
 

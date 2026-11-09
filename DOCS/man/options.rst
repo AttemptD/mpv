@@ -3940,6 +3940,25 @@ Disc Devices
 
         ``mpv bd:// --bluray-device=/path/to/bd/``
 
+``--bluray-remote-cache=<bytes>``
+    Read-through cache for remote Blu-ray ISO block access (default: 32 MiB).
+    libbluray often reads isolated 2 KiB UDF blocks; the cache fetches aligned
+    1 MiB chunks to reduce HTTP Range and SMB round trips. Set to ``0`` to
+    disable it. This option does not affect local ISO files or directories.
+
+``--bluray-remote-prefetch=<bytes>``
+    Sequentially cache the start of a remote Blu-ray ISO before handing it to
+    libbluray (default: 8 MiB). The final 1 MiB UDF anchor region is cached as
+    well. This avoids several high-latency backward HTTP Range or SMB seeks
+    during startup. The amount is capped by ``--bluray-remote-cache``; set it
+    to ``0`` to disable startup prefetch.
+
+``--bluray-remote-fast-open=<yes|no>``
+    Avoid building mpv's alternate-title/edition list for a remote ISO when
+    playing ``bd://longest`` or a direct ``bd://mpls/...`` playlist (default:
+    yes). Main-title detection and normal playback still use libbluray. Set to
+    ``no`` if selecting alternate Blu-ray titles from mpv is required.
+
 ``--cdda-...``
     These options can be used to tune the CD Audio reading feature of mpv.
 
@@ -5809,6 +5828,21 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
 ``--curl-max-redirects=<0-100>``
     Maximum number of HTTP redirects to follow before reporting an error
     (default: 16).
+
+``--curl-reuse-redirects=<yes|no>``
+    Reuse a validated HTTP redirect destination for later byte-range requests
+    within the same open stream (default: ``yes``). An expired destination or
+    invalid range response is retried through the original URL. No destination
+    is shared between files or retained after closing. Explicit HTTP headers,
+    URL credentials, cookies and TLS client certificates disable this shortcut
+    to preserve authentication scoping.
+
+``--curl-cache-prefix=<yes|no>``
+    Retain up to 1 MiB of already received, seekable HTTP stream data at byte
+    offset zero (default: ``yes``). This avoids re-downloading the beginning
+    after reading container metadata at the end. The cache belongs to one open
+    stream and is also limited by ``--curl-buffer-size``. It does not prefetch
+    data or change timestamp, subtitle, index or font probing.
 
 ``--curl-max-retries=<0-100>``
     Number of times a single seekable transfer may be transparently

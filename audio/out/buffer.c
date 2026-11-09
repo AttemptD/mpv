@@ -176,17 +176,26 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
 }
 
 static int ao_read_data_locked(struct ao *ao, void **data, int samples,
-                               int64_t out_time_ns, bool *eof, bool pad_silence)
+                               int64_t out_time_ns, bool *eof, bool pad_silence,
+                               bool buffered)
 {
     struct buffer_state *p = ao->buffer_state;
     mp_assert(!ao->driver->write);
 
     int pos = read_buffer(ao, data, samples, eof, pad_silence);
 
-    if (pos > 0)
-        p->end_time_ns = out_time_ns;
+    if (pos > 0) {
+        // A queued renderer owns only the frames actually returned, not the
+        // unfilled part of a request. Its timeline must reflect the real tail.
+        p->end_time_ns = out_time_ns - (buffered
+            ? MP_TIME_S_TO_NS((samples - pos) / (double)ao->samplerate) : 0);
+    }
 
-    if (pos < samples && p->playing && !p->paused) {
+    // AVFoundation calls us to prefetch, not at a hardware output deadline.
+    // An empty decoder queue is not an audible underrun while its renderer
+    // still holds samples. The renderer signals EOF once that tail is played.
+    bool queued = buffered && (*eof || p->end_time_ns > mp_time_ns());
+    if (pos < samples && p->playing && !p->paused && !queued) {
         p->playing = false;
         ao->wakeup_cb(ao->wakeup_ctx);
         // For ao_drain().
@@ -220,10 +229,22 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, b
         eof = &eof_buf;
     }
 
-    int pos = ao_read_data_locked(ao, data, samples, out_time_ns, eof, pad_silence);
+    int pos = ao_read_data_locked(ao, data, samples, out_time_ns, eof, pad_silence, false);
 
     mp_mutex_unlock(&p->lock);
 
+    return pos;
+}
+
+// A prefetching renderer with a real presentation clock. Unlike the hardware
+// callbacks above, this caller must explicitly signal when its EOF tail drains.
+int ao_read_data_buffered(struct ao *ao, void **data, int samples,
+                          int64_t out_time_ns, bool *eof)
+{
+    struct buffer_state *p = ao->buffer_state;
+    mp_mutex_lock(&p->lock);
+    int pos = ao_read_data_locked(ao, data, samples, out_time_ns, eof, false, true);
+    mp_mutex_unlock(&p->lock);
     return pos;
 }
 
@@ -272,7 +293,13 @@ int ao_read_data_converted(struct ao *ao, struct ao_convert_fmt *fmt,
 void ao_stop_streaming(struct ao *ao)
 {
     struct buffer_state *p = ao->buffer_state;
+    mp_mutex_lock(&p->lock);
     p->streaming = false;
+    p->playing = false;
+    mp_cond_broadcast(&p->wakeup);
+    mp_mutex_unlock(&p->lock);
+    ao->wakeup_cb(ao->wakeup_ctx);
+    ao_wakeup(ao);
 }
 
 int ao_control(struct ao *ao, enum aocontrol cmd, void *arg)
@@ -306,7 +333,13 @@ double ao_get_delay(struct ao *ao)
     } else {
         int64_t end = p->end_time_ns;
         int64_t now = mp_time_ns();
-        driver_delay = MPMAX(0, MP_TIME_NS_TO_S(end - now));
+        // A hardware-paused pull renderer retains its queued samples. Its
+        // delay must not drain against wall time while the clock is stopped.
+        struct mp_pcm_state state = {.delay = -1};
+        if (ao->driver->get_state) ao->driver->get_state(ao, &state);
+        driver_delay = state.delay >= 0 ? state.delay : MPMAX(0, MP_TIME_NS_TO_S(
+            p->paused && p->hw_paused && !ao->stream_silence
+                ? p->queued_time_ns : end - now));
     }
 
     int64_t pending = mp_async_queue_get_samples(p->queue);

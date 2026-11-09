@@ -1401,6 +1401,20 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     if (demuxer->opts->index_mode != 1)
         avfc->flags |= AVFMT_FLAG_IGNIDX;
 
+    // Match the Android DVD path: reordered MPEG-2 packets may carry only
+    // DTS. Generate presentation timestamps before handing frames to a
+    // platform decoder, rather than letting missing PTS become zero.
+    struct stream_dvd_info_req dvd_info;
+    if (priv->stream &&
+        stream_control(priv->stream, STREAM_CTRL_GET_DVD_INFO, &dvd_info) ==
+        STREAM_OK) {
+        avfc->flags |= AVFMT_FLAG_GENPTS;
+        // Disc seeks are time-based. FFmpeg's probing must not simulate byte
+        // seeks through a live libdvdnav stream and consume a different cell.
+        priv->is_dvd_bd = true;
+        MP_VERBOSE(demuxer, "Generating missing DVD packet PTS for decoder compatibility.\n");
+    }
+
     if (lavfdopts->probesize) {
         if (av_opt_set_int(avfc, "probesize", lavfdopts->probesize, 0) < 0)
             MP_ERR(demuxer, "couldn't set option probesize to %"PRId64"\n",

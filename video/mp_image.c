@@ -233,6 +233,7 @@ static void mp_image_destructor(void *ptr)
     av_buffer_unref(&mpi->icc_profile);
     av_buffer_unref(&mpi->a53_cc);
     av_buffer_unref(&mpi->dovi);
+    mp_image_unrefp(&mpi->apple_native);
     av_buffer_unref(&mpi->film_grain);
     for (int n = 0; n < mpi->num_ff_side_data; n++)
         av_buffer_unref(&mpi->ff_side_data[n].buf);
@@ -377,6 +378,7 @@ struct mp_image *mp_image_new_ref(struct mp_image *img)
 
     new->enhancement_layer = img->enhancement_layer
         ? mp_image_new_ref(img->enhancement_layer) : NULL;
+    new->apple_native = mp_image_new_ref(img->apple_native);
 
     return new;
 }
@@ -412,6 +414,7 @@ struct mp_image *mp_image_new_dummy_ref(struct mp_image *img)
     new->num_ff_side_data = 0;
     new->ff_side_data = NULL;
     new->enhancement_layer = NULL;
+    new->apple_native = NULL;
     return new;
 }
 
@@ -596,6 +599,10 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     }
 
     mp_image_setrefp(&dst->enhancement_layer, src->enhancement_layer);
+    // A filter copying attributes may have changed pixels. Only identity refs
+    // preserve the original native surface; the decoder attaches it after its
+    // own copy-back, where equivalence is known.
+    mp_image_unrefp(&dst->apple_native);
 }
 
 // Crop the given image to (x0, y0)-(x1, y1) (bottom/right border exclusive)

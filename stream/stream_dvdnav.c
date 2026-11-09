@@ -48,6 +48,7 @@
 #include "options/path.h"
 #include "osdep/timer.h"
 #include "stream.h"
+#include "stream_dvdnav.h"
 #include "demux/demux.h"
 #include "video/out/vo.h"
 
@@ -68,6 +69,10 @@ struct priv {
 
     int track;
     char *device;
+
+    // Optional image source supplied by another mpv stream backend.
+    void *external_opaque;
+    struct mp_dvdnav_stream_cb external_cb;
 
     struct dvd_opts *opts;
 };
@@ -542,8 +547,24 @@ static void stream_dvdnav_close(stream_t *s)
     if (priv->dvdnav)
         dvdnav_close(priv->dvdnav);
     priv->dvdnav = NULL;
-    if (priv->dvd_speed)
+    if (priv->dvd_speed && priv->filename)
         dvd_set_speed(s, priv->filename, -1);
+    if (priv->external_opaque && priv->external_cb.close) {
+        priv->external_cb.close(s, priv->external_opaque);
+        priv->external_opaque = NULL;
+    }
+}
+
+static int external_seek(void *opaque, uint64_t position)
+{
+    struct priv *priv = opaque;
+    return priv->external_cb.seek(priv->external_opaque, position);
+}
+
+static int external_read(void *opaque, void *buffer, int size)
+{
+    struct priv *priv = opaque;
+    return priv->external_cb.read(priv->external_opaque, buffer, size);
 }
 
 static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
@@ -575,35 +596,23 @@ static struct priv *new_dvdnav_stream(stream_t *stream, char *filename)
     return priv;
 }
 
-static int open_s_internal(stream_t *stream)
+static int finish_dvdnav_open(stream_t *stream)
 {
-    struct priv *priv, *p;
-    priv = p = stream->priv;
-    char *filename;
+    struct priv *priv = stream->priv;
+    struct priv *p = priv;
     int ret = 0;
 
-    p->opts = mp_get_config_group(stream, stream->global, &dvd_conf);
+    dvdnav_set_readahead_flag(priv->dvdnav, 1);
+    if (dvdnav_set_PGC_positioning_flag(priv->dvdnav, 1) != DVDNAV_STATUS_OK)
+        MP_ERR(stream, "stream_dvdnav, failed to set PGC positioning\n");
 
-    if (p->device && p->device[0])
-        filename = p->device;
-    else if (p->opts->device && p->opts->device[0])
-        filename = p->opts->device;
-    else
-        filename = DEFAULT_OPTICAL_DEVICE;
-    if (!new_dvdnav_stream(stream, filename)) {
-        MP_ERR(stream, "Couldn't open DVD device: %s\n",
-                filename);
-        ret = STREAM_ERROR;
-        goto err;
-    }
-
-    if (p->track == TITLE_LONGEST) { // longest
+    if (p->track == TITLE_LONGEST) {
         dvdnav_t *dvdnav = priv->dvdnav;
         uint64_t best_length = 0;
         int best_title = -1;
         int32_t num_titles;
         if (dvdnav_get_number_of_titles(dvdnav, &num_titles) == DVDNAV_STATUS_OK) {
-            MP_VERBOSE(stream, "List of available titles:\n");
+            MP_VERBOSE(stream, "List of available DVD titles:\n");
             for (int n = 1; n <= num_titles; n++) {
                 uint64_t *parts = NULL, duration = 0;
                 dvdnav_describe_title_chapters(dvdnav, n, &parts, &duration);
@@ -612,7 +621,7 @@ static int open_s_internal(stream_t *stream)
                         best_length = duration;
                         best_title = n;
                     }
-                    if (duration > 90000) { // arbitrarily ignore <1s titles
+                    if (duration > 90000) {
                         char *time = mp_format_time(duration / 90000, false);
                         MP_VERBOSE(stream, "title: %3d duration: %s\n",
                                    n - 1, time);
@@ -623,14 +632,14 @@ static int open_s_internal(stream_t *stream)
             }
         }
         p->track = best_title - 1;
-        MP_INFO(stream, "Selecting title %d.\n", p->track);
+        MP_INFO(stream, "Selecting DVD title %d.\n", p->track);
     }
 
     if (p->track >= 0) {
         priv->title = p->track;
         if (dvdnav_title_play(priv->dvdnav, p->track + 1) != DVDNAV_STATUS_OK) {
             MP_FATAL(stream, "dvdnav_stream, couldn't select title %d, error '%s'\n",
-                   p->track, dvdnav_err_to_string(priv->dvdnav));
+                     p->track, dvdnav_err_to_string(priv->dvdnav));
             ret = STREAM_UNSUPPORTED;
             goto err;
         }
@@ -653,6 +662,62 @@ static int open_s_internal(stream_t *stream)
 err:
     stream_dvdnav_close(stream);
     return ret;
+}
+
+static int open_s_internal(stream_t *stream)
+{
+    struct priv *p = stream->priv;
+    char *filename;
+    int ret = 0;
+
+    p->opts = mp_get_config_group(stream, stream->global, &dvd_conf);
+
+    if (p->device && p->device[0])
+        filename = p->device;
+    else if (p->opts->device && p->opts->device[0])
+        filename = p->opts->device;
+    else
+        filename = DEFAULT_OPTICAL_DEVICE;
+    if (!new_dvdnav_stream(stream, filename)) {
+        MP_ERR(stream, "Couldn't open DVD device: %s\n",
+                filename);
+        ret = STREAM_ERROR;
+        goto err;
+    }
+
+    return finish_dvdnav_open(stream);
+
+err:
+    stream_dvdnav_close(stream);
+    return ret;
+}
+
+int mp_dvdnav_open_external(stream_t *stream, void *opaque,
+                            const struct mp_dvdnav_stream_cb *callbacks,
+                            int title)
+{
+    struct priv *priv = talloc_zero(stream, struct priv);
+    stream->priv = priv;
+    priv->opts = mp_get_config_group(stream, stream->global, &dvd_conf);
+    priv->track = title;
+    priv->external_opaque = opaque;
+    priv->external_cb = *callbacks;
+
+    dvdnav_stream_cb dvd_callbacks = {
+        .pf_seek = external_seek,
+        .pf_read = external_read,
+        .pf_readv = NULL,
+    };
+    if (dvdnav_open_stream(&priv->dvdnav, priv, &dvd_callbacks) !=
+        DVDNAV_STATUS_OK || !priv->dvdnav)
+    {
+        MP_VERBOSE(stream, "Remote image is not a DVD-Video disc.\n");
+        stream_dvdnav_close(stream);
+        return STREAM_UNSUPPORTED;
+    }
+
+    MP_INFO(stream, "Remote DVD-Video ISO detected; using libdvdnav.\n");
+    return finish_dvdnav_open(stream);
 }
 
 static int open_s(stream_t *stream)

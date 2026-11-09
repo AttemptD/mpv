@@ -247,7 +247,11 @@ sources = files(
     'video/out/gpu/utils.c',
     'video/out/gpu/video.c',
     'video/out/gpu/video_shaders.c',
+    'video/out/gpu_next/libmpv_gpu_next.c',
+    'video/out/gpu_next/ra.c',
+    'video/out/gpu_next/video.c',
     'video/out/libmpv_sw.c',
+    'video/out/libmpv_apple.c',
     'video/out/vo.c',
     'video/out/vo_gpu.c',
     'video/out/vo_image.c',
@@ -421,6 +425,7 @@ add_project_link_arguments(link_flags, language: ['c', 'cpp', 'objc'])
 
 # osdep
 if darwin
+    sources += files('video/out/gpu_next/afuse_vt.m')
     path_source = files('osdep/path-darwin.c')
     timer_source = files('osdep/timer-darwin.c')
 endif
@@ -663,7 +668,8 @@ dvdnav_opt = get_option('dvdnav').require(
     get_option('gpl'),
     error_message: 'the build is not GPL!',
 )
-dvdnav = dependency('dvdnav', version: '>= 4.2.0', required: dvdnav_opt)
+dvdnav = dependency('dvdnav', version: '>= 4.2.0', required: dvdnav_opt,
+                    static: true)
 features += {'dvdnav': dvdnav.found()}
 if features['dvdnav']
     dependencies += dvdnav
@@ -848,7 +854,7 @@ avfoundation = dependency('appleframeworks', modules: ['CoreMedia', 'AVFoundatio
 features += {'avfoundation': avfoundation.found()}
 if features['avfoundation']
     dependencies += avfoundation
-    sources += files('audio/out/ao_avfoundation.m')
+    sources += files('audio/out/ao_avfoundation.m', 'audio/decode/afuse_spatial.m')
 endif
 
 coreaudio = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreAudio',

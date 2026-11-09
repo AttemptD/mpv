@@ -53,6 +53,7 @@
 #include "video/csputils.h"
 #include "video/sws_utils.h"
 #include "video/out/vo.h"
+#include "video/out/libmpv_apple.h"
 
 #include "options/m_option.h"
 
@@ -143,6 +144,7 @@ const struct m_sub_options vd_lavc_conf = {
 #define OPT_BASE_STRUCT struct hwdec_opts
 
 struct hwdec_opts {
+    bool apple_native_dolby;
     int software_fallback;
     char **hwdec_api;
     char *hwdec_codecs;
@@ -156,6 +158,8 @@ const struct m_sub_options hwdec_conf = {
         {"hwdec", OPT_STRINGLIST(hwdec_api),
             .help = hwdec_opt_help,
             .flags = M_OPT_OPTIONAL_PARAM | M_OPT_ALLOW_NO | UPDATE_HWDEC},
+        {"libmpv-apple-native-dolby", OPT_BOOL(apple_native_dolby),
+            .flags = UPDATE_HWDEC},
         {"hwdec-codecs", OPT_STRING(hwdec_codecs),
             .flags = UPDATE_HWDEC},
         {"hwdec-extra-frames", OPT_CHOICE(hwdec_extra_frames, {"auto", -1}),
@@ -771,6 +775,10 @@ static void init_avctx(struct mp_filter *vd)
     if (ctx->use_hwdec) {
         avctx->opaque = vd;
         avctx->hwaccel_flags |= AV_HWACCEL_FLAG_IGNORE_LEVEL;
+#ifdef AV_HWACCEL_FLAG_APPLE_NATIVE_DOVI
+        if (ctx->hwdec_opts->apple_native_dolby)
+            avctx->hwaccel_flags |= AV_HWACCEL_FLAG_APPLE_NATIVE_DOVI;
+#endif
         if (!lavc_param->check_hw_profile)
             avctx->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
 
@@ -1389,6 +1397,11 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
 
     if (ctx->use_hwdec && ctx->hwdec.copying && res->hwctx) {
         struct mp_image *sw = mp_image_hw_download(res, ctx->hwdec_swpool);
+        // Retain the decoder's original CVPixelBuffer and opaque metadata.
+        // The ordinary copy remains available for the existing HDR/SDR/PiP path.
+        if (sw && ctx->hwdec_opts->apple_native_dolby &&
+            res->imgfmt == IMGFMT_VIDEOTOOLBOX && res->planes[3])
+            sw->apple_native = mp_image_new_ref(res);
         mp_image_unrefp(&res);
         res = sw;
         if (!res) {

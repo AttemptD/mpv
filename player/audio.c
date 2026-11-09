@@ -767,6 +767,15 @@ void reload_audio_output(struct MPContext *mpctx)
     if (!mpctx->ao)
         return;
 
+    // AVFoundation queues seconds of PCM inside its renderer. The generic
+    // filter delay below does not include those samples after ao_reset().
+    // Capture the audible playhead before discarding them, or route changes
+    // and fallback skip ahead to the decoder's already-buffered position.
+    if (strcmp(ao_get_name(mpctx->ao), "avfoundation") == 0 &&
+        mpctx->demuxer && mpctx->demuxer->seekable &&
+        mpctx->playback_pts != MP_NOPTS_VALUE)
+        issue_refresh_seek(mpctx, MPSEEK_EXACT);
+
     ao_reset(mpctx->ao);
     uninit_audio_out(mpctx);
     reinit_audio_filters(mpctx); // mostly to issue refresh seek

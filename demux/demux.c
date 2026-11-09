@@ -4016,7 +4016,7 @@ struct sh_stream *demuxer_stream_by_demuxer_id(struct demuxer *d,
 // current position
 // On a switch, it seeks back, and then grabs all packets that were
 // "missing" from the packet queue of the newly selected stream.
-static void initiate_refresh_seek(struct demux_internal *in,
+static bool initiate_refresh_seek(struct demux_internal *in,
                                   struct demux_stream *stream,
                                   double start_ts)
 {
@@ -4042,12 +4042,12 @@ static void initiate_refresh_seek(struct demux_internal *in,
     }
 
     if (start_ts == MP_NOPTS_VALUE || !seekable)
-        return;
+        return false;
 
     if (!normal_seek) {
         if (!refresh_possible) {
             MP_VERBOSE(in, "can't issue refresh seek\n");
-            return;
+            return false;
         }
 
         for (int n = 0; n < in->num_streams; n++) {
@@ -4082,14 +4082,20 @@ static void initiate_refresh_seek(struct demux_internal *in,
         start_ts -= 1.0; // small offset to get correct overlap
     }
 
+    // A cached stream may already have reached EOF and stopped prefetching.
+    // The new decoder can request its first packet before execute_seek clears
+    // EOF; it then waits for a wakeup without re-enabling in->reading. A refresh
+    // seek is for an active reader, so explicitly restart demuxing here.
+    in->reading = true;
     MP_VERBOSE(in, "refresh seek to %f\n", start_ts);
     in->seeking = true;
     in->seek_flags = SEEK_HR;
     in->seek_pts = start_ts;
+    return true;
 }
 
 // Called locked.
-static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
+static bool refresh_track(struct demux_internal *in, struct sh_stream *stream,
                           double ref_pts)
 {
     struct demux_stream *ds = stream->ds;
@@ -4118,13 +4124,14 @@ static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
     if (!in->after_seek || (ds->type != STREAM_VIDEO && !avoid_refresh)) {
         MP_VERBOSE(in, "refresh track %d (%s)\n", stream->index,
                    stream_type_name(ds->type));
-        initiate_refresh_seek(in, ds, ref_pts);
+        return initiate_refresh_seek(in, ds, ref_pts);
     }
+    return true;
 }
 
 static bool select_track(struct demux_internal *in,
                          struct sh_stream *stream,
-                         double ref_pts, bool selected)
+                         double ref_pts, bool selected, bool *refresh_required)
 {
     struct demux_stream *ds = stream->ds;
     if (ds->selected == selected)
@@ -4134,25 +4141,29 @@ static bool select_track(struct demux_internal *in,
     update_stream_selection_state(in, ds);
     in->tracks_switched = true;
     if (ds->selected)
-        refresh_track(in, stream, ref_pts);
+        *refresh_required |= !refresh_track(in, stream, ref_pts);
     return true;
 }
 
 // Set whether the given stream should return packets.
 // ref_pts is used only if the stream is enabled. Then it serves as approximate
 // start pts for this stream (in the worst case it is ignored).
-void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
+// Return true when preserving queued video packets during a refresh was not
+// possible. The player must resynchronize from its playhead, not let a newly
+// selected audio stream begin at the network prefetch position.
+bool demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
                           double ref_pts, bool selected)
 {
     struct demux_internal *in = demuxer->in;
     mp_mutex_lock(&in->lock);
-    bool changed = select_track(in, stream, ref_pts, selected);
+    bool refresh_required = false;
+    bool changed = select_track(in, stream, ref_pts, selected, &refresh_required);
     if (stream->group && !stream->dependent_track) {
         for (int i = 0; i < stream->group->num_members; i++) {
             struct sh_stream *m = stream->group->members[i];
             mp_assert(m);
             if (m != stream && m->dependent_track)
-                changed |= select_track(in, m, ref_pts, selected);
+                changed |= select_track(in, m, ref_pts, selected, &refresh_required);
         }
     }
     if (changed) {
@@ -4163,6 +4174,7 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
         }
     }
     mp_mutex_unlock(&in->lock);
+    return refresh_required;
 }
 
 // Execute a refresh seek on the given stream.

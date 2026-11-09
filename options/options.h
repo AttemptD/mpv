@@ -86,6 +86,8 @@ typedef struct mp_vo_opts {
     int video_sync;
 
     struct m_geometry android_surface_size;
+    // Host authorization. Disabled until the verified account grants access.
+    bool libmpv_dovi_mapping;
 
     struct m_geometry d3d11_composition_size;
 
@@ -162,6 +164,9 @@ struct mp_osd_render_opts {
 struct mp_bluray_opts {
     char *bluray_device;
     int angle;
+    int64_t remote_cache_size;
+    int64_t remote_prefetch_size;
+    bool remote_fast_open;
 };
 
 typedef struct MPOpts {

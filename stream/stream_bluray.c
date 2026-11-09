@@ -28,8 +28,10 @@
 
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
 
 #include <libbluray/bluray.h>
+#include <libbluray/filesystem.h>
 #include <libbluray/meta_data.h>
 #include <libbluray/overlay.h>
 #include <libbluray/keys.h>
@@ -45,6 +47,9 @@
 #include "options/options.h"
 #include "options/path.h"
 #include "stream.h"
+#if HAVE_DVDNAV
+#include "stream_dvdnav.h"
+#endif
 #include "osdep/io.h"
 #include "osdep/timer.h"
 #include "sub/osd.h"
@@ -52,6 +57,7 @@
 #include "video/mp_image.h"
 
 #define BLURAY_SECTOR_SIZE     6144
+#define BLURAY_REMOTE_CHUNK_SIZE (1024 * 1024)
 
 #define BLURAY_DEFAULT_ANGLE      0
 #define BLURAY_DEFAULT_CHAPTER    0
@@ -80,11 +86,17 @@ const struct m_sub_options stream_bluray_conf = {
     .opts = (const struct m_option[]) {
         {"device", OPT_STRING(bluray_device), .flags = M_OPT_FILE},
         {"angle", OPT_INT(angle), M_RANGE(1, 999)},
+        {"remote-cache", OPT_BYTE_SIZE(remote_cache_size), M_RANGE(0, 512 * 1024 * 1024)},
+        {"remote-prefetch", OPT_BYTE_SIZE(remote_prefetch_size), M_RANGE(0, 64 * 1024 * 1024)},
+        {"remote-fast-open", OPT_BOOL(remote_fast_open)},
         {0},
     },
     .size = sizeof(struct mp_bluray_opts),
     .defaults = &(const struct mp_bluray_opts){
         .angle = 1,
+        .remote_cache_size = 32 * 1024 * 1024,
+        .remote_prefetch_size = 8 * 1024 * 1024,
+        .remote_fast_open = true,
     },
 };
 
@@ -100,9 +112,174 @@ struct bluray_priv_s {
     int cfg_playlist;
     char *cfg_device;
 
+    // Remote ISO stream proxy (NULL for local disc)
+    stream_t *iso_stream;
+    struct bluray_remote_cache_entry *iso_cache;
+    int iso_cache_entries;
+    uint64_t iso_cache_clock;
+    uint64_t iso_cache_hits;
+    uint64_t iso_cache_misses;
+    int64_t iso_proxy_position;
+    bool remote_fast_mode;
+
     struct mp_bluray_opts *opts;
     struct m_config_cache *opts_cache;
 };
+
+struct bluray_remote_cache_entry {
+    int64_t offset;
+    int size;
+    uint64_t age;
+    uint8_t *data;
+};
+
+// Check if a device path looks like a remote URL (not a local path)
+static bool is_remote_url(const char *path)
+{
+    // Matches schemes like http://, https://, smb://, ftp://, etc.
+    const char *p = path;
+    if (!p || !*p)
+        return false;
+    while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= '0' && *p <= '9') || *p == '+' || *p == '-' || *p == '.'))
+        p++;
+    return p > path && p[0] == ':' && p[1] == '/' && p[2] == '/';
+}
+
+// read_blocks callback for bd_open_stream: proxies block reads through mpv stream
+static struct bluray_remote_cache_entry *bd_proxy_cache_entry(
+    struct bluray_priv_s *b, int64_t chunk_offset)
+{
+    struct bluray_remote_cache_entry *oldest = NULL;
+    for (int i = 0; i < b->iso_cache_entries; i++) {
+        struct bluray_remote_cache_entry *entry = &b->iso_cache[i];
+        if (entry->data && entry->size > 0 && entry->offset == chunk_offset) {
+            entry->age = ++b->iso_cache_clock;
+            b->iso_cache_hits++;
+            return entry;
+        }
+        if (!oldest || !entry->data || entry->age < oldest->age)
+            oldest = entry;
+        if (!entry->data)
+            break;
+    }
+
+    b->iso_cache_misses++;
+    if (!oldest)
+        return NULL;
+    if (!oldest->data)
+        oldest->data = talloc_array(b, uint8_t, BLURAY_REMOTE_CHUNK_SIZE);
+    oldest->size = 0;
+    if (!oldest->data || !stream_seek(b->iso_stream, chunk_offset))
+        return NULL;
+
+    int total = stream_read(b->iso_stream, oldest->data,
+                            BLURAY_REMOTE_CHUNK_SIZE);
+    if (total <= 0)
+        return NULL;
+    oldest->offset = chunk_offset;
+    oldest->size = total;
+    oldest->age = ++b->iso_cache_clock;
+    return oldest;
+}
+
+// read_blocks callback for bd_open_stream. libudfread often requests only one
+// 2 KiB block at a time. A large aligned LRU turns those random reads into far
+// fewer HTTP Range/SMB operations, matching AfuseKt's Exo ISO adapter.
+static int bd_proxy_read_at(struct bluray_priv_s *b, void *buf,
+                            int64_t offset, int size)
+{
+    if (!b || !b->iso_stream || offset < 0 || size <= 0)
+        return -1;
+
+    if (!b->iso_cache_entries) {
+        if (!stream_seek(b->iso_stream, offset))
+            return -1;
+        return stream_read(b->iso_stream, buf, size);
+    }
+
+    int total = 0;
+    while (total < size) {
+        int64_t position = offset + total;
+        int64_t chunk_offset = position & ~(int64_t)(BLURAY_REMOTE_CHUNK_SIZE - 1);
+        int in_chunk = position - chunk_offset;
+        struct bluray_remote_cache_entry *entry =
+            bd_proxy_cache_entry(b, chunk_offset);
+        if (!entry || in_chunk >= entry->size)
+            break;
+
+        int copy = MPMIN(size - total, entry->size - in_chunk);
+        memcpy((uint8_t *)buf + total, entry->data + in_chunk, copy);
+        total += copy;
+    }
+    return total > 0 ? total : -1;
+}
+
+static int bd_proxy_read_blocks(void *handle, void *buf, int lba, int num_blocks)
+{
+    struct bluray_priv_s *b = handle;
+    if (!b || lba < 0 || num_blocks <= 0 || num_blocks > INT_MAX / 2048)
+        return -1;
+
+    int total = bd_proxy_read_at(b, buf, (int64_t)lba * 2048,
+                                 num_blocks * 2048);
+    return total > 0 ? total / 2048 : -1;
+}
+
+#if HAVE_DVDNAV
+static int dvd_proxy_seek(void *handle, uint64_t position)
+{
+    struct bluray_priv_s *b = handle;
+    if (position > INT64_MAX)
+        return -1;
+    b->iso_proxy_position = position;
+    return 0;
+}
+
+static int dvd_proxy_read(void *handle, void *buf, int size)
+{
+    struct bluray_priv_s *b = handle;
+    int read = bd_proxy_read_at(b, buf, b->iso_proxy_position, size);
+    if (read > 0)
+        b->iso_proxy_position += read;
+    return read;
+}
+#endif
+
+// libbluray first reads the UDF anchor near the end of the image, then jumps
+// back to descriptors and BDMV metadata near the start. On high-latency HTTP
+// and SMB sources those jumps dominate startup. Cache the head sequentially
+// while the initial connection is already open, plus the final anchor chunk,
+// so libbluray's subsequent reads are memory hits.
+static void bd_proxy_prefetch_metadata(stream_t *s, struct bluray_priv_s *b)
+{
+    if (!b->iso_cache_entries || b->opts->remote_prefetch_size <= 0)
+        return;
+
+    // Reserve one cache slot for the tail anchor whenever possible.
+    int head_entries = b->opts->remote_prefetch_size /
+                       BLURAY_REMOTE_CHUNK_SIZE;
+    head_entries = MPMIN(head_entries, MPMAX(0, b->iso_cache_entries - 1));
+
+    int loaded = 0;
+    for (int i = 0; i < head_entries; i++) {
+        if (!bd_proxy_cache_entry(b,
+                (int64_t)i * BLURAY_REMOTE_CHUNK_SIZE))
+            break;
+        loaded++;
+    }
+
+    bool tail_loaded = false;
+    int64_t size = stream_get_size(b->iso_stream);
+    if (size > 0) {
+        int64_t tail_offset = (size - 1) &
+            ~(int64_t)(BLURAY_REMOTE_CHUNK_SIZE - 1);
+        tail_loaded = !!bd_proxy_cache_entry(b, tail_offset);
+    }
+
+    MP_INFO(s, "Remote ISO metadata prefetch: %d MiB head; tail: %s\n",
+            loaded, tail_loaded ? "cached" : "unavailable");
+}
 
 inline static int play_playlist(struct bluray_priv_s *priv, int playlist)
 {
@@ -114,9 +291,8 @@ inline static int play_title(struct bluray_priv_s *priv, int title)
     return bd_select_title(priv->bd, title);
 }
 
-static void bluray_stream_close(stream_t *s)
+static void bluray_priv_close(stream_t *s, struct bluray_priv_s *priv)
 {
-    struct bluray_priv_s *priv = s->priv;
     if (!priv)
         return;
 
@@ -124,7 +300,25 @@ static void bluray_stream_close(stream_t *s)
         bd_free_title_info(priv->title_info);
     if (priv->bd)
         bd_close(priv->bd);
+    if (priv->iso_stream) {
+        MP_INFO(s, "Remote ISO cache: %"PRIu64" hits, %"PRIu64" misses\n",
+                priv->iso_cache_hits, priv->iso_cache_misses);
+        free_stream(priv->iso_stream);
+        priv->iso_stream = NULL;
+    }
 }
+
+static void bluray_stream_close(stream_t *s)
+{
+    bluray_priv_close(s, s->priv);
+}
+
+#if HAVE_DVDNAV
+static void dvd_proxy_close(stream_t *s, void *opaque)
+{
+    bluray_priv_close(s, opaque);
+}
+#endif
 
 static void handle_event(stream_t *s, const BD_EVENT *ev)
 {
@@ -223,6 +417,8 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         return STREAM_OK;
     }
     case STREAM_CTRL_GET_NUM_TITLES: {
+        if (b->remote_fast_mode)
+            return STREAM_UNSUPPORTED;
         *((unsigned int *)arg) = b->num_titles;
         return STREAM_OK;
     }
@@ -437,13 +633,78 @@ static int bluray_stream_open_internal(stream_t *s)
         bd_set_debug_mask(0);
 
     /* open device */
+    BLURAY *bd;
     char *device_tmp = mp_get_user_path(NULL, s->global, device);
-    BLURAY *bd = bd_open(device_tmp, NULL);
-    talloc_free(device_tmp);
-    if (!bd) {
-        MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
-        ret = STREAM_UNSUPPORTED;
-        goto err;
+
+    struct stat device_stat;
+    bool local_image = !is_remote_url(device_tmp) &&
+        stat(device_tmp, &device_stat) == 0 && S_ISREG(device_stat.st_mode);
+    bool remote_image = is_remote_url(device_tmp) &&
+        strncmp(device_tmp, "file://", 7) != 0;
+    if (is_remote_url(device_tmp) || local_image) {
+        /* Both local and remote images use the same Blu-ray/DVD probe. */
+        b->iso_stream = stream_create(device_tmp,
+                                      STREAM_READ | s->stream_origin,
+                                      s->cancel, s->global);
+        talloc_free(device_tmp);
+        if (!b->iso_stream) {
+            MP_ERR(s, "Couldn't open remote stream: %s\n", device);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+
+        b->iso_cache_entries = remote_image
+            ? b->opts->remote_cache_size / BLURAY_REMOTE_CHUNK_SIZE : 0;
+        if (b->iso_cache_entries) {
+            b->iso_cache = talloc_zero_array(b,
+                struct bluray_remote_cache_entry, b->iso_cache_entries);
+            if (!b->iso_cache)
+                b->iso_cache_entries = 0;
+        }
+        b->remote_fast_mode = remote_image && b->opts->remote_fast_open &&
+            (b->cfg_title == BLURAY_DEFAULT_TITLE ||
+             b->cfg_title == BLURAY_PLAYLIST_TITLE);
+        MP_INFO(s, "Opening remote Blu-ray ISO (block cache: %d MiB; "
+                   "fast open: %s)\n", b->iso_cache_entries,
+                   b->remote_fast_mode ? "yes" : "no");
+
+        if (remote_image)
+            bd_proxy_prefetch_metadata(s, b);
+
+        bd = bd_init();
+        if (!bd) {
+            MP_ERR(s, "Couldn't initialize libbluray.\n");
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
+        if (!bd_open_stream(bd, b, bd_proxy_read_blocks)) {
+            MP_VERBOSE(s, "Remote image is not Blu-ray; probing DVD-Video: %s\n",
+                       device);
+            bd_close(bd);
+#if HAVE_DVDNAV
+            b->iso_proxy_position = 0;
+            const struct mp_dvdnav_stream_cb dvd_callbacks = {
+                .seek = dvd_proxy_seek,
+                .read = dvd_proxy_read,
+                .close = dvd_proxy_close,
+            };
+            int dvd_title = b->cfg_title >= 0
+                          ? b->cfg_title : -2; // TITLE_LONGEST
+            return mp_dvdnav_open_external(s, b, &dvd_callbacks, dvd_title);
+#else
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+#endif
+        }
+    } else {
+        /* Local path: use standard bd_open */
+        bd = bd_open(device_tmp, NULL);
+        talloc_free(device_tmp);
+        if (!bd) {
+            MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
+            ret = STREAM_UNSUPPORTED;
+            goto err;
+        }
     }
     b->bd = bd;
 
@@ -452,18 +713,20 @@ static int bluray_stream_open_internal(stream_t *s)
         goto err;
     }
 
-    /* check for available titles on disc */
-    b->num_titles = bd_get_titles(bd, TITLES_RELEVANT, 0);
-    if (!b->num_titles) {
+    /* A direct remote MPLS does not need the expensive full title scan. */
+    if (b->cfg_title != BLURAY_PLAYLIST_TITLE)
+        b->num_titles = bd_get_titles(bd, TITLES_RELEVANT, 0);
+    if (!b->num_titles && b->cfg_title != BLURAY_PLAYLIST_TITLE) {
         MP_ERR(s, "Can't find any Blu-ray-compatible title here.\n");
         ret = STREAM_UNSUPPORTED;
         goto err;
     }
 
-    MP_INFO(s, "List of available titles:\n");
+    if (!b->remote_fast_mode)
+        MP_INFO(s, "List of available titles:\n");
 
     /* parse titles information */
-    for (int i = 0; i < b->num_titles; i++) {
+    for (int i = 0; !b->remote_fast_mode && i < b->num_titles; i++) {
         /* the information we're accessing (duration, playlist, angle count)
          * doesn't depend on the angle */
         BLURAY_TITLE_INFO *ti = bd_get_title_info(bd, i, 0);
@@ -485,7 +748,9 @@ static int bluray_stream_open_internal(stream_t *s)
     // initialize libbluray event queue
     bd_get_event(bd, NULL);
 
-    select_initial_title(s, bd_get_main_title(bd));
+    int title_guess = b->cfg_title == BLURAY_PLAYLIST_TITLE
+                    ? -1 : bd_get_main_title(bd);
+    select_initial_title(s, title_guess);
 
     if (!bd_select_angle(bd, b->opts->angle - 1))
         MP_WARN(s, "Couldn't select angle '%d'.\n", b->opts->angle - 1);
@@ -498,7 +763,10 @@ static int bluray_stream_open_internal(stream_t *s)
     s->priv        = b;
     s->demuxer     = "+disc";
 
-    MP_VERBOSE(s, "Blu-ray successfully opened.\n");
+    if (b->iso_stream)
+        MP_INFO(s, "Remote Blu-ray ISO successfully opened.\n");
+    else
+        MP_VERBOSE(s, "Blu-ray successfully opened.\n");
 
     return STREAM_OK;
 

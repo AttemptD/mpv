@@ -172,6 +172,7 @@ static const m_option_t mp_vo_opt_list[] = {
     {"video-margin-ratio-top", OPT_FLOAT(margin_y[0]), M_RANGE(0.0, 1.0)},
     {"video-margin-ratio-bottom", OPT_FLOAT(margin_y[1]), M_RANGE(0.0, 1.0)},
     {"video-crop", OPT_RECT(video_crop), .flags = UPDATE_IMGPAR},
+    {"libmpv-dovi-mapping", OPT_BOOL(libmpv_dovi_mapping), .flags = UPDATE_VD},
     {"video-unscaled", OPT_CHOICE(unscaled,
         {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
     {"video-recenter", OPT_BOOL(recenter)},

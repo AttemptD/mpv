@@ -172,6 +172,9 @@ struct ao_driver {
     // Return false on failure.
     bool (*write)(struct ao *ao, void **data, int samples);
     // push based: return mandatory stream information
+    // pull based: optional presentation-clock delay; negative uses deadlines.
+    // Called under the buffer lock, so pull implementations must not wait for
+    // their feeding queue (an atomic clock snapshot avoids lock inversion).
     void (*get_state)(struct ao *ao, struct mp_pcm_state *state);
 
     // Return the list of devices currently available in the system. Use
@@ -201,6 +204,9 @@ struct ao_driver {
 // These functions can be called by AOs.
 
 int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, bool *eof, bool pad_silence, bool blocking);
+// Prefetch without reporting an underrun before already queued audio plays.
+// At EOF the caller must wait for its presentation clock, then ao_stop_streaming.
+int ao_read_data_buffered(struct ao *ao, void **data, int samples, int64_t out_time_ns, bool *eof);
 
 bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s,
                          struct mp_chmap *map);

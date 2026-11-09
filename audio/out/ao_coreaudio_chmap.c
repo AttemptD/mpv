@@ -50,7 +50,7 @@ static const int speaker_map[][2] = {
     { kAudioChannelLabel_LeftWide,             MP_SPEAKER_ID_WL   },
     { kAudioChannelLabel_RightWide,            MP_SPEAKER_ID_WR   },
     { kAudioChannelLabel_LFE2,                 MP_SPEAKER_ID_LFE2 },
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 130000
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 130000
     { kAudioChannelLabel_LeftTopSurround,      MP_SPEAKER_ID_TSL  },
     { kAudioChannelLabel_RightTopSurround,     MP_SPEAKER_ID_TSR  },
     { kAudioChannelLabel_CenterBottom,         MP_SPEAKER_ID_BFC  },
@@ -318,7 +318,7 @@ AudioChannelLayout *ca_get_acl(struct ao *ao, size_t *out_layout_size)
 {
     size_t layout_size = sizeof(AudioChannelLayout)
                          + (ao->channels.num - 1) * sizeof(AudioChannelDescription);
-    AudioChannelLayout *layout = talloc_size(ao, layout_size);
+    AudioChannelLayout *layout = talloc_zero_size(ao, layout_size);
     layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
     layout->mNumberChannelDescriptions = ao->channels.num;
     for (int i = 0; i < ao->channels.num; ++i) {
@@ -339,6 +339,7 @@ AudioChannelLayout *ca_get_acl(struct ao *ao, size_t *out_layout_size)
 }
 
 
+#if !TARGET_OS_IPHONE
 #define CHMAP(n, ...) &(struct mp_chmap) MP_CONCAT(MP_CHMAP, n) (__VA_ARGS__)
 
 // Replace each channel in a with b (a->num == b->num)
@@ -533,3 +534,5 @@ void ca_get_active_chmap(struct ao *ao, AudioDeviceID device, int channel_count,
             mp_chmap_to_str(out_map));
 }
 #endif
+
+#endif // HAVE_COREAUDIO || HAVE_AVFOUNDATION

@@ -40,6 +40,9 @@
 #include "filters/filter_internal.h"
 #include "options/m_config.h"
 #include "options/options.h"
+#if HAVE_AVFOUNDATION
+#include "afuse_spatial.h"
+#endif
 
 struct priv {
     struct mp_codec_params *codec;
@@ -54,12 +57,17 @@ struct priv {
     struct lavc_state state;
 
     struct mp_decoder public;
+#if HAVE_AVFOUNDATION
+    struct afuse_spatial *spatial;
+    bool spatial_eof;
+#endif
 };
 
 #define OPT_BASE_STRUCT struct ad_lavc_params
 struct ad_lavc_params {
     float ac3drc;
     bool downmix;
+    bool spatial_apac;
     int threads;
     char **avopts;
 };
@@ -68,6 +76,9 @@ const struct m_sub_options ad_lavc_conf = {
     .opts = (const m_option_t[]) {
         {"ac3drc", OPT_FLOAT(ac3drc), M_RANGE(0, 6)},
         {"downmix", OPT_BOOL(downmix)},
+#if HAVE_AVFOUNDATION
+        {"spatial-apac", OPT_BOOL(spatial_apac)},
+#endif
         {"threads", OPT_INT(threads), M_RANGE(0, 16)},
         {"o", OPT_KEYVALUELIST(avopts)},
         {0}
@@ -147,6 +158,9 @@ static bool init(struct mp_filter *da, struct mp_codec_params *codec,
     }
 
     ctx->next_pts = MP_NOPTS_VALUE;
+#if HAVE_AVFOUNDATION
+    if (opts->spatial_apac) ctx->spatial = afuse_spatial_create(da->log, codec);
+#endif
 
     return true;
 }
@@ -155,6 +169,9 @@ static void ad_lavc_destroy(struct mp_filter *da)
 {
     struct priv *ctx = da->priv;
 
+#if HAVE_AVFOUNDATION
+    afuse_spatial_destroy(ctx->spatial);
+#endif
     avcodec_free_context(&ctx->avctx);
     av_frame_free(&ctx->avframe);
     mp_free_av_packet(&ctx->avpkt);
@@ -170,6 +187,10 @@ static void ad_lavc_reset(struct mp_filter *da)
     ctx->preroll_done = false;
     ctx->next_pts = MP_NOPTS_VALUE;
     ctx->state = (struct lavc_state){0};
+#if HAVE_AVFOUNDATION
+    ctx->spatial_eof = false;
+    afuse_spatial_reset(ctx->spatial);
+#endif
 }
 
 static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
@@ -188,6 +209,12 @@ static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
     int ret = avcodec_send_packet(avctx, mpkt ? priv->avpkt : NULL);
     if (ret < 0)
         MP_ERR(da, "Error decoding audio.\n");
+#if HAVE_AVFOUNDATION
+    if (ret >= 0 && mpkt) {
+        priv->spatial_eof = false;
+        afuse_spatial_packet(priv->spatial, mpkt);
+    }
+#endif
     return ret;
 }
 
@@ -196,6 +223,11 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
     struct priv *priv = da->priv;
     AVCodecContext *avctx = priv->avctx;
 
+#if HAVE_AVFOUNDATION
+    struct mp_aframe *converted = afuse_spatial_pop(priv->spatial);
+    if (converted) { *out = MAKE_FRAME(MP_FRAME_AUDIO, converted); return 0; }
+    if (priv->spatial_eof) return AVERROR_EOF;
+#endif
     int ret = avcodec_receive_frame(avctx, priv->avframe);
 
     if (ret == AVERROR_EOF) {
@@ -203,6 +235,14 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
         // over in case we get new packets at some point in the future.
         // (Don't reset the filter itself, we want to keep other state.)
         avcodec_flush_buffers(priv->avctx);
+#if HAVE_AVFOUNDATION
+        if (priv->spatial) {
+            priv->spatial_eof = true;
+            afuse_spatial_finish(priv->spatial);
+            struct mp_aframe *last = afuse_spatial_pop(priv->spatial);
+            if (last) { *out = MAKE_FRAME(MP_FRAME_AUDIO, last); return 0; }
+        }
+#endif
         return ret;
     } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
         MP_ERR(da, "Error decoding audio.\n");
@@ -264,7 +304,13 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
     mp_aframe_sanitize_float(mpframe);
 
     if (mp_aframe_get_size(mpframe) > 0) {
-        *out = MAKE_FRAME(MP_FRAME_AUDIO, mpframe);
+#if HAVE_AVFOUNDATION
+        if (priv->spatial) {
+            afuse_spatial_pcm(priv->spatial, mpframe);
+            mpframe = afuse_spatial_pop(priv->spatial);
+        }
+#endif
+        if (mpframe) *out = MAKE_FRAME(MP_FRAME_AUDIO, mpframe);
     } else {
         talloc_free(mpframe);
     }

@@ -1,31 +1,31 @@
-#include <assert.h>
-#include <limits.h>
-#include <math.h>
-#include <stdatomic.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include "mpv_talloc.h"
-#include "common/common.h"
-#include "misc/bstr.h"
-#include "misc/dispatch.h"
-#include "common/msg.h"
-#include "options/m_config.h"
-#include "options/options.h"
-#include "aspect.h"
-#include "dr_helper.h"
-#include "vo.h"
-#include "video/mp_image.h"
-#include "sub/osd.h"
-#include "osdep/threads.h"
-#include "osdep/timer.h"
-
-#include "common/global.h"
-#include "player/client.h"
-
-#include "libmpv.h"
+#include <math.h>                   // for INFINITY
+#include <stdatomic.h>              // for atomic_load, atomic_bool, atomic_...
+#include <stdbool.h>                // for true, bool, false
+#include <stdint.h>                 // for int64_t, intptr_t, uint64_t, uint...
+#include <stdlib.h>                 // for NULL, abs
+#include <string.h>                 // for strcmp
+#include "aspect.h"                 // for mp_get_src_dst_rects
+#include "common/common.h"          // for mp_rect
+#include "common/global.h"          // for mpv_global
+#include "common/msg.h"             // for MP_VERBOSE, MP_STATS, mp_log_new
+#include "config.h"                 // for HAVE_MACOS_COCOA_CB
+#include "dr_helper.h"              // for dr_helper_acquire_thread, dr_help...
+#include "libmpv.h"                 // for render_backend, render_backend_fns
+#include "libmpv_apple.h"
+#include "misc/dispatch.h"          // for mp_dispatch_queue_process, mp_dis...
+#include "misc/mp_assert.h"         // for mp_assert
+#include "mpv/client.h"             // for mpv_error, mpv_handle
+#include "mpv/render.h"             // for mpv_render_context, mpv_render_pa...
+#include "options/m_config_core.h"  // for m_config_cache_alloc, m_config_ca...
+#include "options/options.h"        // for vo_sub_opts
+#include "osdep/threads.h"          // for mp_mutex_unlock, mp_mutex_lock
+#include "osdep/timer.h"            // for mp_time_ns, MP_TIME_MS_TO_NS
+#include "player/client.h"          // for mp_set_main_render_context, kill_...
+#include "sub/osd.h"                // for mp_osd_res
+#include "ta/ta_talloc.h"           // for talloc_free, talloc_zero, TA_FREEP
+#include "video/img_format.h"       // for mp_imgfmt
+#include "video/mp_image.h"         // for mp_image_params
+#include "vo.h"                     // for vo, vo_frame, mp_voctrl, vo_frame...
 
 #if HAVE_MACOS_COCOA_CB
 #include "osdep/mac/app_bridge.h"
@@ -93,6 +93,9 @@ struct mpv_render_context {
     struct vo_frame *cur_frame;
     struct mp_image_params img_params;
     int vp_w, vp_h;
+    struct mp_rect native_src, native_dst;
+    struct mp_osd_res native_osd;
+    struct osd_state *native_osd_state;
     bool flip;
     bool imgfmt_supported[IMGFMT_END - IMGFMT_START];
     bool need_reconfig;
@@ -107,15 +110,18 @@ struct mpv_render_context {
     // --- All of these can only be accessed from mpv_render_*() API, for
     //     which the user makes sure they're called synchronized.
     struct render_backend *renderer;
+    // CPU output shares the VO, decoder, frame queue and playback clock with
+    // the foreground GPU backend. Selecting it must never retire the VO.
+    struct render_backend *software_renderer;
+    struct render_backend *active_renderer;
     struct m_config_cache *vo_opts_cache;
     struct mp_vo_opts *vo_opts;
 };
 
-const struct render_backend_fns *render_backends[] = {
-    &render_backend_gpu,
-    &render_backend_sw,
-    NULL
-};
+// Forward declare the available render backends
+extern const struct render_backend_fns render_backend_gpu;
+extern const struct render_backend_fns render_backend_gpu_next;
+extern const struct render_backend_fns render_backend_sw;
 
 static void update(struct mpv_render_context *ctx)
 {
@@ -183,6 +189,27 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
 
     if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_ADVANCED_CONTROL, int, 0))
         ctx->advanced_control = true;
+
+    char *backend_name = get_mpv_render_param(params, MPV_RENDER_PARAM_BACKEND, "");
+    const struct render_backend_fns **render_backends;
+
+    if (backend_name && strcmp(backend_name, "gpu-next") == 0) {
+        MP_VERBOSE(ctx, "Using gpu-next backend.\n");
+        static const struct render_backend_fns* backends[] = {
+            &render_backend_gpu_next,
+            &render_backend_sw,
+            NULL
+        };
+        render_backends = backends;
+    } else {
+        MP_VERBOSE(ctx, "Using default gpu backend.\n");
+        static const struct render_backend_fns* backends[] = {
+            &render_backend_gpu,
+            &render_backend_sw,
+            NULL
+        };
+        render_backends = backends;
+    }
 
     int err = MPV_ERROR_NOT_IMPLEMENTED;
     for (int n = 0; render_backends[n]; n++) {
@@ -312,6 +339,11 @@ void mpv_render_context_free(mpv_render_context *ctx)
         talloc_free(ctx->renderer->priv);
         talloc_free(ctx->renderer);
     }
+    if (ctx->software_renderer) {
+        ctx->software_renderer->fns->destroy(ctx->software_renderer);
+        talloc_free(ctx->software_renderer->priv);
+        talloc_free(ctx->software_renderer);
+    }
     talloc_free(ctx->dr);
     talloc_free(ctx->dispatch);
 
@@ -340,17 +372,73 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
     int do_render =
         !GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_SKIP_RENDERING, int, 0);
 
+    struct render_backend *renderer = ctx->renderer;
+    if (do_render && get_mpv_render_param(params, MPV_RENDER_PARAM_SW_SIZE, NULL) &&
+        renderer->fns != &render_backend_sw)
+    {
+        if (!ctx->software_renderer) {
+            struct render_backend *sw = talloc_zero(NULL, struct render_backend);
+            *sw = (struct render_backend){
+                .global = ctx->global, .log = ctx->log, .fns = &render_backend_sw,
+            };
+            mpv_render_param init[] = {
+                {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW}, {0},
+            };
+            int err = sw->fns->init(sw, init);
+            if (err < 0) {
+                sw->fns->destroy(sw);
+                talloc_free(sw->priv);
+                talloc_free(sw);
+                mp_mutex_unlock(&ctx->lock);
+                return err;
+            }
+            ctx->software_renderer = sw;
+        }
+        renderer = ctx->software_renderer;
+    }
+    bool backend_changed = ctx->active_renderer != renderer;
+
+    mpv_render_apple_frame *native = get_mpv_render_param(params, MPV_RENDER_PARAM_APPLE_FRAME, NULL);
+    mpv_render_apple_p7_frame *p7 = get_mpv_render_param(params, MPV_RENDER_PARAM_APPLE_P7_FRAME, NULL);
+    if (p7 && native) {
+        mp_mutex_unlock(&ctx->lock);
+        return MPV_ERROR_INVALID_PARAMETER;
+    }
+    if (p7) native = &p7->frame;
+    if (native) {
+        m_config_cache_update(ctx->vo_opts_cache);
+        struct vo_frame *candidate = ctx->next_frame ? ctx->next_frame : ctx->cur_frame;
+        struct mp_image *img = candidate ? candidate->current : NULL;
+        if (!do_render || native->viewport_w <= 0 || native->viewport_h <= 0 || native->owner) {
+            mp_mutex_unlock(&ctx->lock);
+            return MPV_ERROR_INVALID_PARAMETER;
+        }
+        if (!ctx->vo_opts->libmpv_dovi_mapping || !img || img->params.rotate != 0 ||
+            (!p7 && (img->enhancement_layer || !mp_apple_native_format(img)))) {
+            mp_mutex_unlock(&ctx->lock);
+            return MPV_ERROR_NOT_IMPLEMENTED;
+        }
+        if (p7 && mp_apple_p7_prepare(p7, img) < 0) {
+            mp_mutex_unlock(&ctx->lock);
+            return MPV_ERROR_NOT_IMPLEMENTED;
+        }
+    }
+
     if (do_render) {
         int vp_w, vp_h;
-        int err = ctx->renderer->fns->get_target_size(ctx->renderer, params,
-                                                    &vp_w, &vp_h);
+        int err = 0;
+        if (native) {
+            vp_w = native->viewport_w; vp_h = native->viewport_h;
+        } else {
+            err = renderer->fns->get_target_size(renderer, params, &vp_w, &vp_h);
+        }
         if (err < 0) {
             mp_mutex_unlock(&ctx->lock);
             return err;
         }
 
         if (ctx->vo && (ctx->vp_w != vp_w || ctx->vp_h != vp_h ||
-                        ctx->need_resize))
+                        ctx->need_resize || backend_changed))
         {
             ctx->vp_w = vp_w;
             ctx->vp_h = vp_h;
@@ -359,29 +447,32 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
 
             struct mp_rect src, dst;
             struct mp_osd_res osd;
-            mp_get_src_dst_rects(ctx->log, ctx->vo_opts, ctx->renderer->driver_caps,
+            mp_get_src_dst_rects(ctx->log, ctx->vo_opts, renderer->driver_caps,
                                 &ctx->img_params, vp_w, abs(vp_h),
                                 1.0, &src, &dst, &osd);
 
-            ctx->renderer->fns->resize(ctx->renderer, &src, &dst, &osd);
+            renderer->fns->resize(renderer, &src, &dst, &osd);
+            ctx->native_src = src; ctx->native_dst = dst; ctx->native_osd = osd;
         }
         ctx->need_resize = false;
     }
 
-    if (ctx->need_reconfig)
-        ctx->renderer->fns->reconfig(ctx->renderer, &ctx->img_params);
+    if (ctx->need_reconfig || backend_changed)
+        renderer->fns->reconfig(renderer, &ctx->img_params);
     ctx->need_reconfig = false;
 
-    if (ctx->need_update_external)
-        ctx->renderer->fns->update_external(ctx->renderer, ctx->vo);
+    if (ctx->need_update_external || backend_changed)
+        renderer->fns->update_external(renderer, ctx->vo);
+    ctx->native_osd_state = ctx->vo ? ctx->vo->osd : NULL;
     ctx->need_update_external = false;
 
-    if (ctx->need_reset) {
-        ctx->renderer->fns->reset(ctx->renderer);
+    if (ctx->need_reset || backend_changed) {
+        renderer->fns->reset(renderer);
         if (ctx->cur_frame)
             ctx->cur_frame->still = true;
     }
     ctx->need_reset = false;
+    ctx->active_renderer = renderer;
 
     struct vo_frame *frame = ctx->next_frame;
     int64_t wait_present_count = ctx->present_count;
@@ -408,8 +499,14 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
 
     int err = 0;
 
-    if (do_render)
-        err = ctx->renderer->fns->render(ctx->renderer, params, frame);
+    if (p7)
+        mp_apple_native_geometry(native, frame->current, ctx->native_src,
+                                 ctx->native_dst, ctx->native_osd_state, ctx->native_osd);
+    else if (native)
+        err = mp_apple_native_render(native, frame->current, ctx->native_src,
+                                    ctx->native_dst, ctx->native_osd_state, ctx->native_osd);
+    else if (do_render)
+        err = renderer->fns->render(renderer, params, frame);
 
     if (frame != &dummy)
         talloc_free(frame);
