@@ -3718,6 +3718,11 @@ Property list
         Dolby Vision profile and level. May not be available if the container
         does not provide this information.
 
+    ``track-list/N/dolby-vision-compatibility-id``
+        The base-layer compatibility ID from the Dolby configuration record.
+        ID 1 permits HDR10/PQ base fallback; ID 4 permits HLG base fallback.
+        Unavailable if the container provides no Dolby configuration.
+
     ``track-list/N/metadata``,
         Works like the ``metadata`` property, but it accesses metadata that is
         set per track/stream instead of global values for the entire file.
@@ -3776,6 +3781,7 @@ Property list
                 "replaygain-album-gain" MPV_FORMAT_DOUBLE
                 "dolby-vision-profile" MPV_FORMAT_INT64
                 "dolby-vision-level" MPV_FORMAT_INT64
+                "dolby-vision-compatibility-id" MPV_FORMAT_INT64
                 "metadata"           MPV_FORMAT_NODE_MAP
                     (key and string value for each metadata entry)
 
@@ -4036,6 +4042,12 @@ Property list
     ``decoder-failed`` reports native decoder initialization failure. ``frames``
     and ``osd-updates`` count submitted video buffers and caption updates for
     this VO instance. In other VOs, flags are false and counters are zero.
+
+``android-native-hdr-status``
+    Same counters and failure flags as ``android-native-dolby-status``, scoped
+    to native HDR presentation. ``transfer`` is the requested ``pq`` or ``hlg``
+    signal. The decoder rejects an output format reporting another transfer.
+    The Dolby status remains inactive while native HDR is presenting.
 
 ``current-vo``
     Current video output driver (name as used with ``--vo``).

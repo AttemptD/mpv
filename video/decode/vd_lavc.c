@@ -683,12 +683,13 @@ static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
     return M_OPT_EXIT;
 }
 
-static bool native_dolby_requested(vd_ffmpeg_ctx *ctx)
+static bool native_surface_requested(vd_ffmpeg_ctx *ctx)
 {
 #if HAVE_ANDROID
-    return ctx->vo && ctx->vo->opts->android_native_dolby &&
+    return ctx->vo && (ctx->vo->opts->android_native_dolby || ctx->vo->opts->android_native_hdr) &&
         (strcmp(ctx->vo->driver->name, "mediacodec_embed") == 0 ||
-         strcmp(ctx->vo->driver->name, "android-native-dolby") == 0);
+         strcmp(ctx->vo->driver->name, "android-native-dolby") == 0 ||
+         strcmp(ctx->vo->driver->name, "android-native-hdr") == 0);
 #else
     return false;
 #endif
@@ -729,7 +730,7 @@ static void reinit(struct mp_filter *vd)
     // This VO cannot present software/copy-back frames. Report the first native
     // failure to the host so it can retry with a compatible VO, rather than
     // repeatedly trying a software decoder that the native-only guard rejects.
-    if (!ctx->avctx && use_hwdec && !native_dolby_requested(ctx)) {
+    if (!ctx->avctx && use_hwdec && !native_surface_requested(ctx)) {
         do {
             force_fallback(vd);
         } while (!ctx->avctx);
@@ -746,7 +747,7 @@ static void init_avctx(struct mp_filter *vd)
     vd_ffmpeg_ctx *ctx = vd->priv;
     struct vd_lavc_params *lavc_param = ctx->opts;
     struct mp_codec_params *c = ctx->codec;
-    bool native_dolby = native_dolby_requested(ctx);
+    bool native_surface = native_surface_requested(ctx);
 
     m_config_cache_update(ctx->opts_cache);
 
@@ -889,7 +890,29 @@ static void init_avctx(struct mp_filter *vd)
     }
 
 #if HAVE_ANDROID
-    if (native_dolby) {
+    if (native_surface && ctx->vo->opts->android_native_hdr) {
+        int transfer = ctx->vo->opts->android_native_hdr;
+        bool compatible = !c->dovi || (c->dv_profile == 8 && !c->dv_el_present &&
+            c->dv_bl_compatibility_id == (transfer == 16 ? 1 : 4));
+        bool codec_ok = !strcmp(lavc_codec->name, "hevc_mediacodec") ||
+                        !strcmp(lavc_codec->name, "vp9_mediacodec") ||
+                        !strcmp(lavc_codec->name, "av1_mediacodec");
+        if (!ctx->use_hwdec || ctx->hwdec.copying || !codec_ok || !compatible ||
+            av_opt_set_int(avctx, "native_hdr_output", transfer, AV_OPT_SEARCH_CHILDREN) < 0) {
+            MP_ERR(vd, "Native HDR requires compatible PQ/HLG MediaCodec Surface decoding.\n");
+            goto error;
+        }
+        // A prior native Dolby decoder can report its processed PQ output in
+        // codec info. For P8 base presentation the compatibility ID, not that
+        // processed transfer, defines the original HDR10/HLG signal.
+        if (c->dovi) {
+            avctx->color_trc = transfer;
+            avctx->color_primaries = AVCOL_PRI_BT2020;
+            avctx->colorspace = AVCOL_SPC_BT2020_NCL;
+            avctx->color_range = AVCOL_RANGE_MPEG;
+        }
+    }
+    if (native_surface && ctx->vo->opts->android_native_dolby) {
         if (!ctx->use_hwdec || ctx->hwdec.copying ||
             strcmp(lavc_codec->name, "hevc_mediacodec") != 0 ||
             (c->dv_profile != 5 && c->dv_profile != 8)) {
@@ -931,7 +954,7 @@ static void init_avctx(struct mp_filter *vd)
 
 error:
     MP_ERR(vd, "Could not open codec.\n");
-    if (native_dolby && ctx->vo)
+    if (native_surface && ctx->vo)
         vo_control(ctx->vo, VOCTRL_ANDROID_NATIVE_DOLBY_DECODER_FAILED, NULL);
     uninit_avctx(vd);
 }

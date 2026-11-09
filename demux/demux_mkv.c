@@ -1826,6 +1826,7 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track, int idx)
         sh_v->dovi = true;
         sh_v->dv_level = track->dovi_config->dv_level;
         sh_v->dv_profile = track->dovi_config->dv_profile;
+        sh_v->dv_bl_compatibility_id = track->dovi_config->dv_bl_signal_compatibility_id;
         sh_v->dv_el_present = track->dovi_config->bl_present_flag &&
                               track->dovi_config->el_present_flag;
     }

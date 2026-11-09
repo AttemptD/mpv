@@ -7288,6 +7288,15 @@ them.
     with separate video and caption Surfaces. The embedding application selects
     this per file; it must use another VO for unsupported streams or processing.
 
+``--android-native-hdr=<no|pq|hlg>``
+    Present compatible HDR10/PQ or HLG frames with ``--vo=android-native-hdr``
+    and ``--hwdec=mediacodec`` (default: no). Uses the same video/caption host
+    as native Dolby, but selects an ordinary HEVC/VP9/AV1 decoder. P8 requires
+    compatibility ID 1 for PQ or 4 for HLG; P5/P7 are rejected. The HDR base
+    path removes P8 RPU NAL units without transcoding its HEVC picture data.
+    Do not enable together with ``android-native-dolby``. Applications must
+    verify the matching display/decoder capability and implement GPU fallback.
+
 ``--android-native-dolby-surface=<reference>``
     JNI-only reference to the embedding application's ``NativeDolbySurface``
     object. Like ``wid``, the reference is owned by the embedding application.

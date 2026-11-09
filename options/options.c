@@ -259,6 +259,8 @@ static const m_option_t mp_vo_opt_list[] = {
 #endif
 #if HAVE_ANDROID
     {"android-native-dolby", OPT_BOOL(android_native_dolby), .flags = UPDATE_VO},
+    {"android-native-hdr", OPT_CHOICE(android_native_hdr,
+        {"no", 0}, {"pq", 16}, {"hlg", 18}), .flags = UPDATE_VO},
     {"android-native-dolby-surface", OPT_INT64(android_native_dolby_surface), .flags = UPDATE_VO},
 #endif
 #if HAVE_D3D11

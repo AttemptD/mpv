@@ -829,6 +829,7 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
             sh->codec->dovi = true;
             sh->codec->dv_profile = cfg->dv_profile;
             sh->codec->dv_level = cfg->dv_level;
+            sh->codec->dv_bl_compatibility_id = cfg->dv_bl_signal_compatibility_id;
             sh->codec->dv_el_present = cfg->bl_present_flag && cfg->el_present_flag;
         }
 

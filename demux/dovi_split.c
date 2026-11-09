@@ -113,6 +113,7 @@ struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
         el->codec->dovi = true;
         el->codec->dv_profile = cfg->dv_profile;
         el->codec->dv_level = cfg->dv_level;
+        el->codec->dv_bl_compatibility_id = cfg->dv_bl_signal_compatibility_id;
         el->codec->dv_el_present = cfg->el_present_flag;
         break;
     }

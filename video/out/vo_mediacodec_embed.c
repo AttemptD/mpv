@@ -49,7 +49,7 @@ static bool java_ok(struct vo *vo, JNIEnv *env)
     (*env)->ExceptionDescribe(env);
     (*env)->ExceptionClear(env);
     ((struct priv *)vo->priv)->failed = true;
-    MP_ERR(vo, "Native Dolby Vision Surface operation failed.\n");
+    MP_ERR(vo, "Native video Surface operation failed.\n");
     return false;
 }
 
@@ -94,7 +94,7 @@ static bool init_host(struct vo *vo)
         return false;
     p->captions = ANativeWindow_fromSurface(env, surface);
     (*env)->DeleteLocalRef(env, surface);
-    if (!p->video_surface || !p->captions)
+    if (!java_ok(vo, env) || !p->video_surface || !p->captions)
         return false;
     p->osd_change = -1;
     return true;
@@ -123,8 +123,13 @@ static int preinit(struct vo *vo)
     if (!strcmp(vo->driver->name, "android-native-dolby") &&
         !vo->opts->android_native_dolby)
         return -1;
-    if (vo->opts->android_native_dolby && !init_host(vo)) {
-        MP_ERR(vo, "Native Dolby Vision requires the video/caption Surface host.\n");
+    if (!strcmp(vo->driver->name, "android-native-hdr") &&
+        !vo->opts->android_native_hdr)
+        return -1;
+    if (vo->opts->android_native_dolby && vo->opts->android_native_hdr)
+        return -1;
+    if ((vo->opts->android_native_dolby || vo->opts->android_native_hdr) && !init_host(vo)) {
+        MP_ERR(vo, "Native output requires the video/caption Surface host.\n");
         return -1;
     }
     vo->hwdec_devs = hwdec_devices_create();
@@ -348,6 +353,20 @@ const struct vo_driver video_out_mediacodec_embed = {
 const struct vo_driver video_out_android_native_dolby = {
     .description = "Android native Dolby Vision with a separate caption Surface",
     .name = "android-native-dolby",
+    .caps = VO_CAP_NORETAIN | VO_CAP_ROTATE90,
+    .preinit = preinit,
+    .query_format = query_format,
+    .control = control,
+    .draw_frame = draw_frame,
+    .flip_page = flip_page,
+    .reconfig = reconfig,
+    .uninit = uninit,
+    .priv_size = sizeof(struct priv),
+};
+
+const struct vo_driver video_out_android_native_hdr = {
+    .description = "Android native HDR10/HLG with a separate caption Surface",
+    .name = "android-native-hdr",
     .caps = VO_CAP_NORETAIN | VO_CAP_ROTATE90,
     .preinit = preinit,
     .query_format = query_format,

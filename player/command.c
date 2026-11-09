@@ -2224,6 +2224,8 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
                         .unavailable = !has_rg},
         {"dolby-vision-profile", SUB_PROP_INT(p.dv_profile),
                         .unavailable = !p.dovi},
+        {"dolby-vision-compatibility-id", SUB_PROP_INT(p.dv_bl_compatibility_id),
+                        .unavailable = !p.dovi},
         {"dolby-vision-level", SUB_PROP_INT(p.dv_level),
                         .unavailable = !p.dovi},
         {"metadata", SUB_PROP_KEYVALUE_LIST(tag_list),
@@ -3160,7 +3162,10 @@ static int mp_property_android_native_dolby(void *ctx, struct m_property *prop,
 {
     MPContext *mpctx = ctx;
     struct voctrl_android_native_dolby state = {0};
-    if (mpctx->video_out)
+    bool hdr = !strcmp(prop->name, "android-native-hdr-status");
+    if (mpctx->video_out &&
+        (hdr ? mpctx->opts->vo->android_native_hdr != 0
+             : mpctx->opts->vo->android_native_dolby))
         vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_NATIVE_DOLBY, &state);
     struct m_sub_property props[] = {
         {"active", SUB_PROP_BOOL(state.active)},
@@ -3168,6 +3173,8 @@ static int mp_property_android_native_dolby(void *ctx, struct m_property *prop,
         {"decoder-failed", SUB_PROP_BOOL(state.decoder_failed)},
         {"frames", SUB_PROP_INT64(state.frames)},
         {"osd-updates", SUB_PROP_INT64(state.osd_updates)},
+        {"transfer", SUB_PROP_STR(hdr ? (mpctx->opts->vo->android_native_hdr == 18 ? "hlg" :
+                                           mpctx->opts->vo->android_native_hdr == 16 ? "pq" : "no") : "dolby")},
         {0}
     };
     return m_property_read_sub(props, action, arg);
@@ -4840,6 +4847,7 @@ static const struct m_property mp_properties_base[] = {
 
     {"osd-dimensions", mp_property_osd_dim},
     {"android-native-dolby-status", mp_property_android_native_dolby},
+    {"android-native-hdr-status", mp_property_android_native_dolby},
     M_PROPERTY_ALIAS("osd-width", "osd-dimensions/w"),
     M_PROPERTY_ALIAS("osd-height", "osd-dimensions/h"),
     M_PROPERTY_ALIAS("osd-par", "osd-dimensions/par"),
@@ -8595,7 +8603,7 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         // Removing the video chain switches the playback clock to buffered
         // audio. Preserve the visible paused Android position before that happens,
         // instead of resolving a relative zero seek after decoder teardown.
-        bool android_managed = mp_android_p7_active(mpctx) || opts->vo->android_native_dolby;
+        bool android_managed = mp_android_p7_active(mpctx) || opts->vo->android_native_dolby || opts->vo->android_native_hdr;
         double paused_pts = opts->pause && android_managed
                             ? get_current_time(mpctx) : MP_NOPTS_VALUE;
         double resume_pts = android_managed
@@ -8694,7 +8702,7 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
 
     if (flags & UPDATE_VD && mpctx->vo_chain) {
         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
-        double paused_pts = opts->pause && (opts->vo->android_dovi_dual || opts->vo->android_native_dolby)
+        double paused_pts = opts->pause && (opts->vo->android_dovi_dual || opts->vo->android_native_dolby || opts->vo->android_native_hdr)
                             ? get_current_time(mpctx) : MP_NOPTS_VALUE;
         uninit_video_chain(mpctx);
         reinit_video_chain(mpctx);

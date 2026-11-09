@@ -176,6 +176,7 @@ struct mp_codec_params {
     bool dovi;
     uint8_t dv_profile;
     uint8_t dv_level;
+    uint8_t dv_bl_compatibility_id;
     bool dv_el_present;     // BL and EL interleaved in this stream (Profile 7)
 
     // STREAM_VIDEO + STREAM_AUDIO

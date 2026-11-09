@@ -711,6 +711,14 @@ Available video output drivers are:
     The application must check both the display and decoder's Dolby support.
     Software decoding, video filters, shaders and P7/FEL require another VO.
 
+``android-native-hdr`` (Android embedding)
+    Presents HEVC/VP9/AV1 HDR video directly to the platform Surface, using
+    ``android-native-hdr=pq`` or ``hlg``. Requires the same Surface host and
+    non-copy MediaCodec decoding as ``android-native-dolby``. Video is not
+    GPU tone-mapped; captions remain on their independent SDR layer. P8 base
+    fallback is explicitly selected by its compatibility ID. P7/FEL, software
+    decoding, pixel filters and shaders must use another VO.
+
 ``wlshm`` (Wayland only)
     Shared memory video output driver without hardware acceleration that works
     whenever Wayland is present.
