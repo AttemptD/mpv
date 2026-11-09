@@ -683,6 +683,17 @@ static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
     return M_OPT_EXIT;
 }
 
+static bool native_dolby_requested(vd_ffmpeg_ctx *ctx)
+{
+#if HAVE_ANDROID
+    return ctx->vo && ctx->vo->opts->android_native_dolby &&
+        (strcmp(ctx->vo->driver->name, "mediacodec_embed") == 0 ||
+         strcmp(ctx->vo->driver->name, "android-native-dolby") == 0);
+#else
+    return false;
+#endif
+}
+
 static void force_fallback(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
@@ -715,7 +726,10 @@ static void reinit(struct mp_filter *vd)
 
     bool use_hwdec = ctx->use_hwdec;
     init_avctx(vd);
-    if (!ctx->avctx && use_hwdec) {
+    // This VO cannot present software/copy-back frames. Report the first native
+    // failure to the host so it can retry with a compatible VO, rather than
+    // repeatedly trying a software decoder that the native-only guard rejects.
+    if (!ctx->avctx && use_hwdec && !native_dolby_requested(ctx)) {
         do {
             force_fallback(vd);
         } while (!ctx->avctx);
@@ -732,7 +746,7 @@ static void init_avctx(struct mp_filter *vd)
     vd_ffmpeg_ctx *ctx = vd->priv;
     struct vd_lavc_params *lavc_param = ctx->opts;
     struct mp_codec_params *c = ctx->codec;
-    bool native_dolby = false;
+    bool native_dolby = native_dolby_requested(ctx);
 
     m_config_cache_update(ctx->opts_cache);
 
@@ -875,10 +889,7 @@ static void init_avctx(struct mp_filter *vd)
     }
 
 #if HAVE_ANDROID
-    if (ctx->vo && ctx->vo->opts->android_native_dolby &&
-        (strcmp(ctx->vo->driver->name, "mediacodec_embed") == 0 ||
-         strcmp(ctx->vo->driver->name, "android-native-dolby") == 0)) {
-        native_dolby = true;
+    if (native_dolby) {
         if (!ctx->use_hwdec || ctx->hwdec.copying ||
             strcmp(lavc_codec->name, "hevc_mediacodec") != 0 ||
             (c->dv_profile != 5 && c->dv_profile != 8)) {
