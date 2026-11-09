@@ -699,6 +699,18 @@ Available video output drivers are:
     To use hardware decoding with ``--vo=gpu`` instead, use ``--hwdec=mediacodec``
     or ``mediacodec-copy`` along with ``--gpu-context=android``.
 
+``android-native-dolby`` (Android embedding)
+    Presents single-layer HEVC Dolby Vision P5/P8 through the platform decoder
+    and a native Surface. Requires ``--hwdec=mediacodec`` and
+    ``--android-native-dolby=yes``. The embedding application must supply the
+    ``NativeDolbySurface`` host through ``android-native-dolby-surface``.
+
+    The host maintains separate video, SDR subtitle/OSD, and background layers.
+    Video buffers and their dynamic metadata are not sampled by the GPU renderer.
+    Crop, zoom, aspect and 90-degree rotation use SurfaceControl geometry.
+    The application must check both the display and decoder's Dolby support.
+    Software decoding, video filters, shaders and P7/FEL require another VO.
+
 ``wlshm`` (Wayland only)
     Shared memory video output driver without hardware acceleration that works
     whenever Wayland is present.

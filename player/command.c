@@ -3155,6 +3155,24 @@ static int mp_property_gpu_context(void *ctx, struct m_property *p, int action, 
                                 mpctx->video_out->context_name : NULL);
 }
 
+static int mp_property_android_native_dolby(void *ctx, struct m_property *prop,
+                                          int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct voctrl_android_native_dolby state = {0};
+    if (mpctx->video_out)
+        vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_NATIVE_DOLBY, &state);
+    struct m_sub_property props[] = {
+        {"active", SUB_PROP_BOOL(state.active)},
+        {"failed", SUB_PROP_BOOL(state.failed)},
+        {"decoder-failed", SUB_PROP_BOOL(state.decoder_failed)},
+        {"frames", SUB_PROP_INT64(state.frames)},
+        {"osd-updates", SUB_PROP_INT64(state.osd_updates)},
+        {0}
+    };
+    return m_property_read_sub(props, action, arg);
+}
+
 static int mp_property_osd_dim(void *ctx, struct m_property *prop,
                                int action, void *arg)
 {
@@ -4821,6 +4839,7 @@ static const struct m_property mp_properties_base[] = {
     {"estimated-frame-number", mp_property_frame_number},
 
     {"osd-dimensions", mp_property_osd_dim},
+    {"android-native-dolby-status", mp_property_android_native_dolby},
     M_PROPERTY_ALIAS("osd-width", "osd-dimensions/w"),
     M_PROPERTY_ALIAS("osd-height", "osd-dimensions/h"),
     M_PROPERTY_ALIAS("osd-par", "osd-dimensions/par"),
@@ -8574,12 +8593,12 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
         struct mp_pin *filter_src = mpctx->vo_chain ? mpctx->vo_chain->filter_src : NULL;
         // Removing the video chain switches the playback clock to buffered
-        // audio. Preserve the visible paused P7 position before that happens,
+        // audio. Preserve the visible paused Android position before that happens,
         // instead of resolving a relative zero seek after decoder teardown.
-        bool android_p7 = mp_android_p7_active(mpctx);
-        double paused_pts = opts->pause && android_p7
+        bool android_managed = mp_android_p7_active(mpctx) || opts->vo->android_native_dolby;
+        double paused_pts = opts->pause && android_managed
                             ? get_current_time(mpctx) : MP_NOPTS_VALUE;
-        double resume_pts = android_p7
+        double resume_pts = android_managed
                             ? get_current_time(mpctx) : MP_NOPTS_VALUE;
         bool hold_packets = track && mpctx->demuxer && mpctx->demuxer->seekable &&
                             resume_pts != MP_NOPTS_VALUE;
@@ -8601,7 +8620,7 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         }
         if (track || filter_src) {
             if (paused_pts != MP_NOPTS_VALUE) {
-                MP_DBG(mpctx, "Preserving paused P7 output position %.6f\n", paused_pts);
+                MP_DBG(mpctx, "Preserving paused Android output position %.6f\n", paused_pts);
                 queue_seek(mpctx, MPSEEK_ABSOLUTE, paused_pts, MPSEEK_VERY_EXACT, 0);
             } else if (hold_packets) {
                 queue_seek(mpctx, MPSEEK_ABSOLUTE, resume_pts, MPSEEK_EXACT, 0);
@@ -8675,7 +8694,7 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
 
     if (flags & UPDATE_VD && mpctx->vo_chain) {
         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
-        double paused_pts = opts->pause && opts->vo->android_dovi_dual
+        double paused_pts = opts->pause && (opts->vo->android_dovi_dual || opts->vo->android_native_dolby)
                             ? get_current_time(mpctx) : MP_NOPTS_VALUE;
         uninit_video_chain(mpctx);
         reinit_video_chain(mpctx);

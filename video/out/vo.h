@@ -85,6 +85,8 @@ enum mp_voctrl {
     VOCTRL_UPDATE_PLAYBACK_STATE,       // struct voctrl_playback_state*
 
     VOCTRL_PERFORMANCE_DATA,            // struct voctrl_performance_data*
+    VOCTRL_GET_ANDROID_NATIVE_DOLBY,    // struct voctrl_android_native_dolby*
+    VOCTRL_ANDROID_NATIVE_DOLBY_DECODER_FAILED,
 
     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
 
@@ -174,6 +176,11 @@ struct mp_frame_perf {
     int count;
     struct mp_pass_perf perf[VO_PASS_PERF_MAX];
     char desc[VO_PASS_PERF_MAX][VO_PASS_DESC_MAX_LEN];
+};
+
+struct voctrl_android_native_dolby {
+    bool active, failed, decoder_failed;
+    int64_t frames, osd_updates;
 };
 
 struct voctrl_performance_data {

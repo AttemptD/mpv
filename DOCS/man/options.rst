@@ -7282,6 +7282,18 @@ them.
     :/opt/homebrew/bin:  homebrew (ARM) install path
     :/opt/homebrew/sbin: homebrew (ARM) install path
 
+``--android-native-dolby=<yes|no>``
+    Enable platform Dolby Vision P5/P8 decoding for the Android native Dolby VO
+    (default: no). Requires a supported decoder/display and an embedding host
+    with separate video and caption Surfaces. The embedding application selects
+    this per file; it must use another VO for unsupported streams or processing.
+
+``--android-native-dolby-surface=<reference>``
+    JNI-only reference to the embedding application's ``NativeDolbySurface``
+    object. Like ``wid``, the reference is owned by the embedding application.
+    It must outlive every VO using it. Zero detaches the host. This is not an
+    Android Surface pointer or a user-facing configuration value.
+
 ``--android-surface-size=<WxH>``
     Set dimensions of the rendering surface used by the Android gpu context.
     Needs to be set by the embedding application if the dimensions change during

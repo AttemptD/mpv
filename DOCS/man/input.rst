@@ -4030,6 +4030,13 @@ Property list
 
     How these details are handled may change in the future.
 
+``android-native-dolby-status``
+    Android embedding status map. ``active`` becomes true after a native frame
+    has been submitted; ``failed`` reports a Surface failure and
+    ``decoder-failed`` reports native decoder initialization failure. ``frames``
+    and ``osd-updates`` count submitted video buffers and caption updates for
+    this VO instance. In other VOs, flags are false and counters are zero.
+
 ``current-vo``
     Current video output driver (name as used with ``--vo``).
 

@@ -732,6 +732,7 @@ static void init_avctx(struct mp_filter *vd)
     vd_ffmpeg_ctx *ctx = vd->priv;
     struct vd_lavc_params *lavc_param = ctx->opts;
     struct mp_codec_params *c = ctx->codec;
+    bool native_dolby = false;
 
     m_config_cache_update(ctx->opts_cache);
 
@@ -873,6 +874,24 @@ static void init_avctx(struct mp_filter *vd)
         goto error;
     }
 
+#if HAVE_ANDROID
+    if (ctx->vo && ctx->vo->opts->android_native_dolby &&
+        (strcmp(ctx->vo->driver->name, "mediacodec_embed") == 0 ||
+         strcmp(ctx->vo->driver->name, "android-native-dolby") == 0)) {
+        native_dolby = true;
+        if (!ctx->use_hwdec || ctx->hwdec.copying ||
+            strcmp(lavc_codec->name, "hevc_mediacodec") != 0 ||
+            (c->dv_profile != 5 && c->dv_profile != 8)) {
+            MP_ERR(vd, "Native Dolby Vision requires P5/P8 MediaCodec Surface decoding.\n");
+            goto error;
+        }
+        if (av_opt_set_int(avctx, "native_dolby_vision", 1, AV_OPT_SEARCH_CHILDREN) < 0) {
+            MP_ERR(vd, "FFmpeg does not support native Dolby Vision Surface decoding.\n");
+            goto error;
+        }
+    }
+#endif
+
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     if (avctx->width > 8192 || avctx->height > 8192) {
         MP_ERR(vd, "Frame size too big %" PRIu32 "x%" PRIu32 ".\n", avctx->width, avctx->height);
@@ -901,6 +920,8 @@ static void init_avctx(struct mp_filter *vd)
 
 error:
     MP_ERR(vd, "Could not open codec.\n");
+    if (native_dolby && ctx->vo)
+        vo_control(ctx->vo, VOCTRL_ANDROID_NATIVE_DOLBY_DECODER_FAILED, NULL);
     uninit_avctx(vd);
 }
 
