@@ -144,6 +144,7 @@ struct vo_w32_state {
 
     int mouse_x;
     int mouse_y;
+    POINT mouse_screen_pos;
 
     // Should SetCursor be called when handling VOCTRL_SET_CURSOR_VISIBILITY?
     bool can_set_cursor;
@@ -1582,6 +1583,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     case WM_ENTERMENULOOP:
         mp_input_put_key(w32->input_ctx, MP_INPUT_RELEASE_ALL);
         break;
+    case WM_EXITMENULOOP:
+        signal_events(w32, VO_EVENT_FOCUS);
+        break;
     case WM_KILLFOCUS:
         mp_input_put_key(w32->input_ctx, MP_INPUT_RELEASE_ALL);
         w32->focused = false;
@@ -1615,12 +1619,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         // https://blogs.msdn.com/b/oldnewthing/archive/2003/10/01/55108.aspx>
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
+        POINT screen_pos = {x, y};
+        ClientToScreen(w32->window, &screen_pos);
         if (x != w32->mouse_x || y != w32->mouse_y) {
+            bool quiet = screen_pos.x == w32->mouse_screen_pos.x &&
+                         screen_pos.y == w32->mouse_screen_pos.y;
             w32->mouse_x = x;
             w32->mouse_y = y;
             if (!should_ignore_mouse_event(w32))
-                mp_input_set_mouse_pos(w32->input_ctx, x, y, false);
+                mp_input_set_mouse_pos(w32->input_ctx, x, y, quiet);
         }
+        w32->mouse_screen_pos = screen_pos;
         break;
     }
     case WM_LBUTTONDOWN:

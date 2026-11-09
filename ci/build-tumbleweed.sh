@@ -7,11 +7,14 @@ meson setup build $common_args $@ \
   -Db_sanitize=address,undefined \
   -Dcdda=enabled \
   -Ddvbin=enabled \
+  -Ddvda=enabled \
   -Ddvdnav=enabled \
   -Dlibarchive=enabled \
   -Dmanpage-build=enabled \
   -Dpipewire=enabled \
+  -Dsixel=enabled \
   -Dsubrandr=enabled \
+  -Dvapoursynth=enabled \
   -Dvulkan=enabled
 meson compile -C build
 ./build/mpv -v --no-config

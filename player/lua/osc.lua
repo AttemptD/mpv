@@ -153,6 +153,9 @@ local user_opts = {
     maximize_mbtn_left_command = "cycle ${?fullscreen==yes:fullscreen}${!fullscreen==yes:window-maximized}",
     maximize_mbtn_mid_command = "",
     maximize_mbtn_right_command = "",
+
+    seekbar_wheel_down_command = "seek -10",
+    seekbar_wheel_up_command = "seek 10",
     -- luacheck: pop
 }
 
@@ -1897,6 +1900,17 @@ local function bar_layout(direction, slim)
         osc_param.playresx = osc_param.playresy * osc_param.display_aspect
     end
 
+    -- Limits for the hitbox extensions of the edge buttons,
+    -- considering the position of window controls
+    local edge_x1, edge_x2 = 0, math.huge
+    if direction > 0 and window_controls_enabled() then
+        if window_controls_alignment() == "left" then
+            edge_x1 = window_control_box_width
+        else
+            edge_x2 = osc_param.playresx - window_control_box_width
+        end
+    end
+
     osc_geo.y = direction * (osc_geo.h - 2 + user_opts.barmargin)
     osc_geo.w = osc_param.playresx + 4
     if direction < 0 then
@@ -1943,11 +1957,11 @@ local function bar_layout(direction, slim)
 
 
     -- Menu
-    geo = { x = osc_geo.x + padX + 4, y = line1, an = 4, w = 18, h = math.abs(line2 - line1) }
+    geo = { x = osc_geo.x + padX + 4, y = line1, an = 4, w = 18, h = 26 }
     lo = add_layout("menu")
     lo.geometry = geo
     lo.style = osc_styles.topButtonsBar
-    lo.hitbox = { x1 = 0 }
+    lo.hitbox = { x1 = edge_x1 }
 
     -- Playlist prev/next
     geo = { x = geo.x + geo.w + padX, y = geo.y, an = geo.an, w = geo.w, h = geo.h }
@@ -1973,7 +1987,7 @@ local function bar_layout(direction, slim)
         lo.geometry = geo
         lo.style = osc_styles.vidtitleBar
         if i == last_custom_button then
-            lo.hitbox = { x2 = math.huge }
+            lo.hitbox = { x2 = edge_x2 }
         end
     end
 
@@ -1985,7 +1999,7 @@ local function bar_layout(direction, slim)
         lo = add_layout("fullscreen")
         lo.geometry = geo
         lo.style = osc_styles.topButtonsBar
-        lo.hitbox = { x2 = math.huge }
+        lo.hitbox = { x2 = edge_x2 }
     else
         -- Cache
         geo = { x = t_r, y = geo.y, an = 6, w = 150, h = geo.h }
@@ -2011,11 +2025,11 @@ local function bar_layout(direction, slim)
 
     -- Playback control buttons
     geo = { x = osc_geo.x + padX + padwc_l, y = line2, an = 4,
-            w = buttonW, h = osc_geo.h - math.abs(line2 - line1)}
+            w = buttonW, h = 30}
     lo = add_layout("play_pause")
     lo.geometry = geo
     lo.style = osc_styles.smallButtonsBar
-    lo.hitbox = { x1 = 0 }
+    lo.hitbox = { x1 = edge_x1 }
 
     geo = { x = geo.x + geo.w + padX, y = geo.y, an = geo.an, w = geo.w, h = geo.h }
     lo = add_layout("chapter_prev")
@@ -2042,7 +2056,7 @@ local function bar_layout(direction, slim)
     lo = add_layout("fullscreen")
     lo.geometry = geo
     lo.style = osc_styles.smallButtonsBar
-    lo.hitbox = { x2 = math.huge }
+    lo.hitbox = { x2 = edge_x2 }
 
     -- Volume
     geo = { x = geo.x - geo.w - padX, y = geo.y, an = geo.an, w = geo.w, h = geo.h }
@@ -2594,9 +2608,9 @@ local function osc_init()
 
     if user_opts.scrollcontrols then
         ne.eventresponder["wheel_up_press"] =
-            function () mp.commandv("osd-auto", "seek",  10) end
+            function () mp.command(user_opts.seekbar_wheel_up_command) end
         ne.eventresponder["wheel_down_press"] =
-            function () mp.commandv("osd-auto", "seek", -10) end
+            function () mp.command(user_opts.seekbar_wheel_down_command) end
     end
 
 

@@ -6,7 +6,7 @@ set -e
 mkdir -p subprojects
 git clone https://code.videolan.org/videolan/libplacebo.git \
     --recurse-submodules --shallow-submodules \
-    --depth=1 --branch v7.360.1 subprojects/libplacebo
+    --depth=1 --branch v7.387.0 subprojects/libplacebo
 
 meson setup build $common_args \
   -Dffmpeg:vulkan=auto \
@@ -14,6 +14,7 @@ meson setup build $common_args \
   -Dlua=enabled \
   -Dopenal=enabled \
   -Dpulse=enabled \
+  -Dsixel=enabled \
   -Dvulkan=enabled \
   -Ddvdnav=enabled \
   -Dcdda=disabled

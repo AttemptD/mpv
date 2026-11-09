@@ -221,6 +221,7 @@ struct priv {
     // --- Specific access depending on threading stuff.
     struct mp_async_queue *queue; // decoded frame output queue
     struct mp_dispatch_queue *dec_dispatch; // non-NULL if decoding thread used
+    bool eof_output;    // an EOF went out: the stream is done for this decoder
     bool dec_thread_lock; // debugging (esp. for no-thread case)
     mp_thread dec_thread;
     bool dec_thread_valid;
@@ -262,7 +263,7 @@ static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
         return M_OPT_EXIT;
     }
     if (strcmp(opt->name, "audio-spdif") == 0) {
-        mp_info(log, "Choices: ac3,dts-hd,dts (and possibly more)\n");
+        mp_info(log, "Choices: ac3,dts-hd,dts,dsd (and possibly more)\n");
         return M_OPT_EXIT;
     }
     return 1;
@@ -346,6 +347,7 @@ static void decf_reset(struct mp_filter *f)
     mp_mutex_unlock(&p->cache_lock);
 
     p->coverart_returned = 0;
+    p->eof_output = false;
 
     for (int n = 0; n < p->num_reverse_queue; n++)
         mp_frame_unref(&p->reverse_queue[n]);
@@ -454,6 +456,14 @@ static bool reinit_decoder(struct priv *p)
                 list = spdif;
             } else {
                 talloc_free(spdif);
+                struct mp_decoder_list *dsd =
+                    select_dsd_codec(p->codec->codec, p->opts->audio_spdif);
+                if (dsd->num_entries) {
+                    driver = &ad_dsd;
+                    list = dsd;
+                } else {
+                    talloc_free(dsd);
+                }
             }
         }
     }
@@ -670,7 +680,8 @@ static void fix_image_params(struct priv *p,
     if (m.p_w <= 0 || m.p_h <= 0)
         m.p_w = m.p_h = 1;
 
-    m.stereo3d = p->codec->stereo_mode;
+    if (!m.stereo3d)
+        m.stereo3d = p->codec->stereo_mode;
 
     if (!mp_rect_equals(&p->codec->crop, &(struct mp_rect){0})) {
         struct mp_rect crop = p->codec->crop;
@@ -951,6 +962,11 @@ static void feed_packet(struct priv *p)
     if (p->decoded_coverart.type)
         return;
 
+    // Don't read after EOF was output. If the stream continues, the player
+    // creates a new decoder.
+    if (p->eof_output)
+        return;
+
     if (!p->packet.type && !p->new_segment) {
         p->packet = mp_pin_out_read(p->demux);
         if (!p->packet.type)
@@ -1158,6 +1174,7 @@ static void read_frame(struct priv *p)
 
 output_frame:
     process_output_frame(p, frame);
+    p->eof_output = frame.type == MP_FRAME_EOF;
     mp_pin_in_write(pin, frame);
 }
 

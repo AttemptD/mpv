@@ -23,6 +23,7 @@
 #include <math.h>
 #include <assert.h>
 #include <libavutil/common.h>
+#include <libavutil/stereo3d.h>
 #include <libavcodec/avcodec.h>
 
 #include "mp_image.h"
@@ -96,9 +97,7 @@ const struct m_opt_choice_alternatives pl_csp_trc_names[] = {
     {"s-log1",      PL_COLOR_TRC_S_LOG1},
     {"s-log2",      PL_COLOR_TRC_S_LOG2},
     {"st428",       PL_COLOR_TRC_ST428},
-#if PL_API_VER >= 362
     {"scrgb",       PL_COLOR_TRC_SCRGB},
-#endif
     {0}
 };
 
@@ -130,12 +129,12 @@ const struct m_opt_choice_alternatives pl_alpha_names[] = {
     {0}
 };
 
-// The short name _must_ match with what vf_stereo3d accepts (if supported).
+// The short names follow the input format names of the vf_stereo3d.
 // The long name in comments is closer to the Matroska spec (StereoMode element).
 // The numeric index matches the Matroska StereoMode value. If you add entries
 // that don't match Matroska, make sure demux_mkv.c rejects them properly.
 const struct m_opt_choice_alternatives mp_stereo3d_names[] = {
-    {"no",     -1}, // disable/invalid
+    {"no",     -1}, // unset, vf_format keeps the source mode
     {"mono",    0},
     {"sbs2l",   1}, // "side_by_side_left"
     {"ab2r",    2}, // "top_bottom_right"
@@ -144,8 +143,8 @@ const struct m_opt_choice_alternatives mp_stereo3d_names[] = {
     {"checkl",  5}, // "checkboard_left"  (unsupported by vf_stereo3d)
     {"irr",     6}, // "row_interleaved_right"
     {"irl",     7}, // "row_interleaved_left"
-    {"icr",     8}, // "column_interleaved_right" (unsupported by vf_stereo3d)
-    {"icl",     9}, // "column_interleaved_left" (unsupported by vf_stereo3d)
+    {"icr",     8}, // "column_interleaved_right"
+    {"icl",     9}, // "column_interleaved_left"
     {"arcc",   10}, // "anaglyph_cyan_red" (Matroska: unclear which mode)
     {"sbs2r",  11}, // "side_by_side_right"
     {"agmc",   12}, // "anaglyph_green_magenta" (Matroska: unclear which mode)
@@ -153,6 +152,29 @@ const struct m_opt_choice_alternatives mp_stereo3d_names[] = {
     {"ar",     14}, // "alternating frames right first"
     {0}
 };
+
+enum mp_stereo3d_mode mp_stereo3d_from_av(const struct AVStereo3D *s3d)
+{
+    bool inv = s3d->flags & AV_STEREO3D_FLAG_INVERT;
+    switch (s3d->type) {
+    case AV_STEREO3D_SIDEBYSIDE:
+    case AV_STEREO3D_SIDEBYSIDE_QUINCUNX:
+        return inv ? MP_STEREO3D_SBS2R : MP_STEREO3D_SBS2L;
+    case AV_STEREO3D_TOPBOTTOM:
+        return inv ? MP_STEREO3D_AB2R : MP_STEREO3D_AB2L;
+    case AV_STEREO3D_CHECKERBOARD:
+        return inv ? MP_STEREO3D_CHECKR : MP_STEREO3D_CHECKL;
+    case AV_STEREO3D_LINES:
+        return inv ? MP_STEREO3D_IRR : MP_STEREO3D_IRL;
+    case AV_STEREO3D_COLUMNS:
+        return inv ? MP_STEREO3D_ICR : MP_STEREO3D_ICL;
+    case AV_STEREO3D_FRAMESEQUENCE:
+        return inv ? MP_STEREO3D_AR : MP_STEREO3D_AL;
+    default:
+        // AV_STEREO3D_2D and types mpv has no mode for.
+        return MP_STEREO3D_MONO;
+    }
+}
 
 void mp_get_3d_side_by_side(int stereo_mode, int div[2])
 {
@@ -187,54 +209,6 @@ enum pl_color_primaries mp_csp_guess_primaries(int width, int height)
     default: // No good metric, just pick BT.709 to minimize damage
         return PL_COLOR_PRIM_BT_709;
     }
-}
-
-// LMS<-XYZ revised matrix from CIECAM97, based on a linear transform and
-// normalized for equal energy on monochrome inputs
-static const pl_matrix3x3 m_cat97 = {{
-    {  0.8562,  0.3372, -0.1934 },
-    { -0.8360,  1.8327,  0.0033 },
-    {  0.0357, -0.0469,  1.0112 },
-}};
-
-// M := M * XYZd<-XYZs
-static void apply_chromatic_adaptation(struct pl_cie_xy src,
-                                       struct pl_cie_xy dest, pl_matrix3x3 *mat)
-{
-    // If the white points are nearly identical, this is a wasteful identity
-    // operation.
-    if (fabs(src.x - dest.x) < 1e-6 && fabs(src.y - dest.y) < 1e-6)
-        return;
-
-    // XYZd<-XYZs = Ma^-1 * (I*[Cd/Cs]) * Ma
-    // http://www.brucelindbloom.com/index.html?Eqn_ChromAdapt.html
-    // For Ma, we use the CIECAM97 revised (linear) matrix
-    float C[3][2];
-
-    for (int i = 0; i < 3; i++) {
-        // source cone
-        C[i][0] = m_cat97.m[i][0] * pl_cie_X(src)
-                + m_cat97.m[i][1] * 1
-                + m_cat97.m[i][2] * pl_cie_Z(src);
-
-        // dest cone
-        C[i][1] = m_cat97.m[i][0] * pl_cie_X(dest)
-                + m_cat97.m[i][1] * 1
-                + m_cat97.m[i][2] * pl_cie_Z(dest);
-    }
-
-    // tmp := I * [Cd/Cs] * Ma
-    pl_matrix3x3 tmp = {0};
-    for (int i = 0; i < 3; i++)
-        tmp.m[i][i] = C[i][1] / C[i][0];
-
-    pl_matrix3x3_mul(&tmp, &m_cat97);
-
-    // M := M * Ma^-1 * tmp
-    pl_matrix3x3 ma_inv = m_cat97;
-    pl_matrix3x3_invert(&ma_inv);
-    pl_matrix3x3_mul(mat, &ma_inv);
-    pl_matrix3x3_mul(mat, &tmp);
 }
 
 // Get multiplication factor required if image data is fit within the LSBs of a
@@ -349,7 +323,7 @@ void mp_get_csp_matrix(struct mp_csp_params *params, struct pl_transform3x3 *m)
     switch (colorspace) {
     case PL_COLOR_SYSTEM_BT_601:     luma_coeffs(m, 0.299,  0.587,  0.114 ); break;
     case PL_COLOR_SYSTEM_BT_709:     luma_coeffs(m, 0.2126, 0.7152, 0.0722); break;
-    case PL_COLOR_SYSTEM_SMPTE_240M: luma_coeffs(m, 0.2122, 0.7013, 0.0865); break;
+    case PL_COLOR_SYSTEM_SMPTE_240M: luma_coeffs(m, 0.212,  0.701,  0.087 ); break;
     case PL_COLOR_SYSTEM_BT_2020_NC: luma_coeffs(m, 0.2627, 0.6780, 0.0593); break;
     case PL_COLOR_SYSTEM_BT_2020_C: {
         // Note: This outputs into the [-0.5,0.5] range for chroma information.
@@ -365,12 +339,11 @@ void mp_get_csp_matrix(struct mp_csp_params *params, struct pl_transform3x3 *m)
         break;
     }
     case PL_COLOR_SYSTEM_XYZ: {
-        // For lack of anything saner to do, just assume the caller wants
-        // DCI-P3 primaries, which is a reasonable assumption.
-        const struct pl_raw_primaries *dst = pl_raw_primaries_get(PL_COLOR_PRIM_DCI_P3);
-        pl_matrix3x3 mat = pl_get_xyz2rgb_matrix(dst);
-        // DCDM X'Y'Z' is expected to have equal energy white point (EG 432-1 Annex H)
-        apply_chromatic_adaptation((struct pl_cie_xy){1.0/3.0, 1.0/3.0}, dst->white, &mat);
+        // XYZ is decoded into the tagged RGB primaries, DCI-P3 for DCDM X'Y'Z'
+        enum pl_color_primaries prim = params->color.primaries;
+        if (!prim)
+            prim = PL_COLOR_PRIM_DCI_P3;
+        pl_matrix3x3 mat = pl_get_xyz2rgb_matrix(pl_raw_primaries_get(prim));
         *m = (struct pl_transform3x3) { .mat = mat };
         levels_in = -1;
         break;

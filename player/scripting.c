@@ -167,7 +167,7 @@ static int64_t mp_load_script(struct MPContext *mpctx, const char *fname)
         // Create the client before creating the thread; otherwise a race
         // condition could happen, where MPContext is destroyed while the
         // thread tries to create the client.
-        .client = mp_new_client(mpctx->clients, script_name),
+        .client = mp_new_weak_client(mpctx->clients, script_name),
     };
 
     talloc_free(tmp);
@@ -179,7 +179,6 @@ static int64_t mp_load_script(struct MPContext *mpctx, const char *fname)
         return -1;
     }
 
-    mp_client_set_weak(arg->client);
     arg->log = mp_client_get_log(arg->client);
     int64_t id = mpv_client_id(arg->client);
 
@@ -270,7 +269,11 @@ void mp_load_builtin_scripts(struct MPContext *mpctx)
     load_builtin_script(mpctx, 5, mpctx->opts->lua_load_select, "@select.lua");
     load_builtin_script(mpctx, 6, mpctx->opts->lua_load_positioning, "@positioning.lua");
     load_builtin_script(mpctx, 7, mpctx->opts->lua_load_commands, "@commands.lua");
-    load_builtin_script(mpctx, 8, mpctx->opts->lua_load_context_menu, "@context_menu.lua");
+
+    // select.lua uses context_menu.lua in D3D11 exclusive fullscreen.
+    struct m_config_option *co = m_config_get_co(mpctx->mconfig, bstr0("d3d11-exclusive-fs"));
+    bool context_menu = mpctx->opts->lua_load_context_menu || (co && *(bool *)co->data);
+    load_builtin_script(mpctx, 8, context_menu, "@context_menu.lua");
 }
 
 bool mp_load_scripts(struct MPContext *mpctx)

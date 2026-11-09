@@ -67,8 +67,6 @@ struct priv {
     pl_gpu gpu;
     struct ra_next *ra;
 
-    // Store a persistent copy of the init params to avoid a dangling pointer.
-    mpv_opengl_init_params gl_params;
 };
 #endif
 
@@ -259,33 +257,6 @@ skip_common_pl_cleanup:
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 /**
- * @brief Callback to make the OpenGL context current.
- * @param priv Pointer to the private data (mpv_opengl_init_params).
- * @return True on success, false on failure.
- */
-static bool pl_callback_makecurrent_gl(void *priv)
-{
-    mpv_opengl_init_params *gl_params = priv;
-    // The mpv render API contract specifies that the client must make the
-    // context current inside its get_proc_address callback. We can trigger
-    // this by calling it with a harmless, common function name.
-    if (gl_params && gl_params->get_proc_address) {
-        gl_params->get_proc_address(gl_params->get_proc_address_ctx, "glGetString");
-        return true;
-    }
-
-    return false;
-}
-
-/**
- * @brief Callback to release the OpenGL context.
- * @param priv Pointer to the private data (mpv_opengl_init_params).
- */
-static void pl_callback_releasecurrent_gl(void *priv)
-{
-}
-
-/**
  * @brief Callback to log messages from libplacebo.
  * @param log_priv Pointer to the private data (mp_log).
  * @param level The log level.
@@ -313,9 +284,6 @@ static int libmpv_gpu_next_init_gl(struct libmpv_gpu_next_context *ctx, mpv_rend
     if (!gl_params || !gl_params->get_proc_address)
         return MPV_ERROR_INVALID_PARAMETER;
 
-    // Make a persistent copy of the params struct's contents.
-    p->gl_params = *gl_params;
-
     // Setup libplacebo logging
     struct pl_log_params log_params = {
         .log_level = PL_LOG_WARN,
@@ -327,9 +295,9 @@ static int libmpv_gpu_next_init_gl(struct libmpv_gpu_next_context *ctx, mpv_rend
     p->gl = pl_opengl_create(p->pl_log, pl_opengl_params(
         .get_proc_addr_ex = (pl_voidfunc_t (*)(void*, const char*))gl_params->get_proc_address,
         .proc_ctx = gl_params->get_proc_address_ctx,
-        .make_current = pl_callback_makecurrent_gl,
-        .release_current = pl_callback_releasecurrent_gl,
-        .priv = &p->gl_params // Pass the ADDRESS of our persistent copy
+        // libmpv's host owns and binds the context before render API calls.
+        // A function resolver does not bind a context or synchronize threads.
+        // Leave callbacks unset so libplacebo does not advertise thread safety.
     ));
 
     if (!p->gl) {

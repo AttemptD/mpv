@@ -245,7 +245,8 @@ Available mpv-only filters are:
         corresponding primaries are used. Otherwise, if the video height is
         exactly 576 (PAL), BT.601-625 is used. If it's exactly 480 or 486 (NTSC),
         BT.601-525 is used. If the video resolution is anything else, BT.709 is
-        used.
+        used. Untagged XYZ content is decoded into DCI-P3, or into BT.2020
+        when its transfer is linear light.
 
         Available primaries are:
 
@@ -361,7 +362,8 @@ Available mpv-only filters are:
     ``<stereo-in>``
         Set the stereo mode the video is assumed to be encoded in. Use
         ``--vf=format:stereo-in=help`` to list all available modes. Check with
-        the ``stereo3d`` filter documentation to see what the names mean.
+        the ``stereo3d`` filter documentation to see what the names mean. The
+        default ``no`` keeps the mode signaled by the source.
 
     ``<rotate>``
         Set the rotation the video is assumed to be encoded with in degrees.

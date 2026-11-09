@@ -84,7 +84,7 @@ static const char def_config[] =
 #include "osdep/w32_register.h"
 #endif
 
-#if HAVE_COCOA
+#if HAVE_COCOA && HAVE_SWIFT
 #include "osdep/mac/app_bridge.h"
 #endif
 
@@ -154,7 +154,7 @@ void mp_update_logging(struct MPContext *mpctx, bool preinit)
         terminal_setup_getch(mpctx->input);
 
     if (enabled)
-        encoder_update_log(mpctx->global);
+        mp_encoder_update_log(mpctx->global);
 }
 
 void mp_print_version(struct mp_log *log, int always)
@@ -190,12 +190,13 @@ void mp_destroy(struct MPContext *mpctx)
     mpctx->encode_lavc_ctx = NULL;
 
     command_uninit(mpctx);
+    disc_nav_destroy(mpctx);
 
     mp_clients_destroy(mpctx);
 
     osd_free(mpctx->osd);
 
-#if HAVE_COCOA
+#if HAVE_COCOA && HAVE_SWIFT
     cocoa_set_input_context(NULL);
 #endif
 
@@ -321,7 +322,7 @@ struct MPContext *mp_create(void)
     mp_clients_init(mpctx);
     mpctx->osd = osd_create(mpctx->global);
 
-#if HAVE_COCOA
+#if HAVE_COCOA && HAVE_SWIFT
     cocoa_set_input_context(mpctx->input);
 #endif
 
@@ -416,17 +417,16 @@ int mp_initialize(struct MPContext *mpctx, char **options)
 
     MP_STATS(mpctx, "start init");
 
-#if HAVE_COCOA
+#if HAVE_COCOA && HAVE_SWIFT
     mpv_handle *ctx = mp_new_client(mpctx->clients, "mac");
     cocoa_set_mpv_handle(ctx);
 #endif
 
 #if HAVE_WIN32_SMTC
-    if (opts->media_controls)
-        mp_smtc_init(mp_new_client(mpctx->clients, "SystemMediaTransportControls"));
+    mp_smtc_init(mp_new_weak_client(mpctx->clients, "SystemMediaTransportControls"));
 #endif
 
-    mp_dnd_init(mp_new_client(mpctx->clients, "dnd"));
+    mp_dnd_init(mp_new_weak_client(mpctx->clients, "dnd"));
 
     mpctx->ipc_ctx = mp_init_ipc(mpctx->clients, mpctx->global);
 

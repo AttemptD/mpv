@@ -31,6 +31,7 @@
 #include <libavutil/common.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/lzo.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/avstring.h>
 
@@ -122,8 +123,8 @@ typedef struct mkv_track {
     float v_projection_pose_roll;
 
     uint32_t a_channels, a_bps;
-    float a_sfreq;
-    float a_osfreq;
+    double a_sfreq;
+    double a_osfreq;
 
     double default_duration;
     double codec_delay;
@@ -178,9 +179,9 @@ typedef struct mkv_index {
 } mkv_index_t;
 
 struct block_info {
-    uint64_t duration, discardpadding;
+    uint64_t duration;
     bool simple, keyframe, duration_known;
-    int64_t timecode;
+    int64_t timecode, discardpadding;
     mkv_track_t *track;
     // Actual packet data.
     AVBufferRef *laces[MAX_NUM_LACES];
@@ -203,6 +204,7 @@ typedef struct mkv_demuxer {
 
     int64_t tc_scale, cluster_tc;
 
+    uint64_t first_cluster;
     uint64_t cluster_start;
     uint64_t cluster_end;
 
@@ -376,6 +378,10 @@ static bstr demux_mkv_decode(struct mp_log *log, mkv_track_t *track,
 
             size = zstream.total_out;
             inflateEnd(&zstream);
+            // The output can be the input of a following LZO encoding, so zero
+            // its input padding.
+            mp_require(zstream.avail_out >= AV_LZO_INPUT_PADDING);
+            memset(dest + size, 0, AV_LZO_INPUT_PADDING);
 #endif
         } else if (enc->comp_algo == 2) {
             /* lzo encoded track */
@@ -409,15 +415,21 @@ static bstr demux_mkv_decode(struct mp_log *log, mkv_track_t *track,
                 dstlen = MPMAX(1, 2 * dstlen);
             }
             size = dstlen - out_avail;
+            // The output can be the input of a following LZO encoding, so zero
+            // its input padding. The output padding always covers it.
+            static_assert(AV_LZO_OUTPUT_PADDING >= AV_LZO_INPUT_PADDING, "");
+            memset(dest + size, 0, AV_LZO_INPUT_PADDING);
         } else if (enc->comp_algo == 3) {
             if (enc->comp_settings_len == 0 || !enc->comp_settings) {
                 mp_warn(log, "missing comp_settings, unable to reconstruct the data.\n");
                 goto error;
             }
-            dest = talloc_size(track->parser_tmp, size + enc->comp_settings_len);
+            dest = talloc_size(track->parser_tmp,
+                               size + enc->comp_settings_len + AV_LZO_INPUT_PADDING);
             memcpy(dest, enc->comp_settings, enc->comp_settings_len);
             memcpy(dest + enc->comp_settings_len, src, size);
             size += enc->comp_settings_len;
+            memset(dest + size, 0, AV_LZO_INPUT_PADDING);
         }
     }
 
@@ -562,16 +574,21 @@ static void parse_trackencodings(struct demuxer *demuxer,
     track->num_encodings = encodings->n_content_encoding;
 }
 
+static bool valid_samplerate(double rate)
+{
+    return rate > 0 && rate <= INT_MAX;
+}
+
 static void parse_trackaudio(struct demuxer *demuxer, struct mkv_track *track,
                              struct ebml_audio *audio)
 {
-    if (audio->n_sampling_frequency) {
+    if (audio->n_sampling_frequency && valid_samplerate(audio->sampling_frequency)) {
         track->a_sfreq = audio->sampling_frequency;
         MP_DBG(demuxer, "|   + Sampling frequency: %f\n", track->a_sfreq);
     } else {
         track->a_sfreq = 8000;
     }
-    if (audio->n_output_sampling_frequency) {
+    if (audio->n_output_sampling_frequency && valid_samplerate(audio->output_sampling_frequency)) {
         track->a_osfreq = audio->output_sampling_frequency;
         MP_DBG(demuxer, "|   + Output sampling frequency: %f\n", track->a_osfreq);
     } else {
@@ -935,6 +952,7 @@ static void parse_trackentry(struct demuxer *demuxer,
         int len = entry->codec_private.len;
         track->private_data = talloc_size(track, len + AV_LZO_INPUT_PADDING);
         memcpy(track->private_data, entry->codec_private.start, len);
+        memset(track->private_data + len, 0, AV_LZO_INPUT_PADDING);
         track->private_size = len;
         MP_DBG(demuxer, "|  + CodecPrivate, length %u\n", track->private_size);
     }
@@ -1096,9 +1114,8 @@ static int demux_mkv_read_cues(demuxer_t *demuxer)
     if (cues.n_cue_point <= 3) // probably too sparse and will just break seeking
         goto done;
 
-    // Discard incremental index. (Keep the first entry, which must be the
-    // start of the file - helps with files that miss the first index entry.)
-    mkv_d->num_indexes = MPMIN(1, mkv_d->num_indexes);
+    // Discard incremental index.
+    mkv_d->num_indexes = 0;
     mkv_d->index_has_durations = false;
 
     for (int i = 0; i < cues.n_cue_point; i++) {
@@ -1646,7 +1663,9 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track, int idx)
         extradata = track->private_data + 40;
         extradata_size = track->private_size - 40;
         mp_set_codec_from_tag(sh_v);
-        track->block_dts = true;
+        // The DTS are the PTS if the codec does not reorder frames.
+        const AVCodecDescriptor *desc = avcodec_descriptor_get(mp_codec_to_av_codec_id(sh_v->codec));
+        track->block_dts = !desc || (desc->props & AV_CODEC_PROP_REORDER);
     } else if (track->private_size >= RVPROPERTIES_SIZE
                && (!strcmp(track->codec_id, "V_REAL/RV10")
                 || !strcmp(track->codec_id, "V_REAL/RV20")
@@ -2149,7 +2168,8 @@ static int demux_mkv_open_audio(demuxer_t *demuxer, mkv_track_t *track, int idx)
         AV_WL16(data + 8, sh_a->bits_per_coded_sample);
         AV_WL32(data + 10, track->a_osfreq);
         mkv_demuxer_t *mkv_d = demuxer->priv;
-        AV_WL32(data + 14, mkv_d->duration * track->a_osfreq);
+        double samples = mkv_d->duration * track->a_osfreq;
+        AV_WL32(data + 14, samples > 0 ? MPMIN(samples, UINT32_MAX) : 0);
     } else if (!strcmp(codec, "opus")) {
         // Hardcode the rate libavcodec's opus decoder outputs, so that
         // AV_PKT_DATA_SKIP_SAMPLES actually works. The Matroska header only
@@ -2534,6 +2554,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
         }
         if (id == MATROSKA_ID_CLUSTER) {
             MP_DBG(demuxer, "|+ found cluster\n");
+            mkv_d->first_cluster = start_pos;
             mkv_d->cluster_start = start_pos;
             break;
         }
@@ -3202,9 +3223,17 @@ static int handle_block(demuxer_t *demuxer, struct block_info *block_info)
             if (i == 0 && block_info->duration_known)
                 dp->duration = block_duration / 1e9;
             if (stream->type == STREAM_AUDIO) {
-                unsigned int srate = stream->codec->samplerate;
-                demux_packet_set_padding(dp, 0,
-                    block_info->discardpadding / 1e9 * srate);
+                int64_t padding = av_rescale(block_info->discardpadding,
+                                             stream->codec->samplerate,
+                                             1000000000);
+                if (padding < -INT_MAX || padding > INT_MAX)
+                    padding = 0;
+                int start = 0, end = 0;
+                if (padding < 0 && i == 0)
+                    start = -padding;
+                if (padding > 0 && i == block_info->num_laces - 1)
+                    end = padding;
+                demux_packet_set_padding(dp, start, end);
                 mkv_d->a_skip_preroll = 0;
             }
             if (block_info->additions) {
@@ -3245,17 +3274,18 @@ static int read_block_group(demuxer_t *demuxer, int64_t end,
 
     while (stream_tell(s) < end) {
         switch (ebml_read_id(s)) {
-        case MATROSKA_ID_BLOCKDURATION:
-            block->duration = ebml_read_uint(s);
-            if (block->duration == EBML_UINT_INVALID)
+        case MATROSKA_ID_BLOCKDURATION:;
+            uint64_t duration;
+            if (!ebml_read_uint(s, &duration))
                 goto error;
-            block->duration *= mkv_d->tc_scale;
-            block->duration_known = true;
+            if (duration <= INT64_MAX / mkv_d->tc_scale) {
+                block->duration = duration * mkv_d->tc_scale;
+                block->duration_known = true;
+            }
             break;
 
         case MATROSKA_ID_DISCARDPADDING:
-            block->discardpadding = ebml_read_uint(s);
-            if (block->discardpadding == EBML_UINT_INVALID)
+            if (!ebml_read_int(s, &block->discardpadding))
                 goto error;
             break;
 
@@ -3265,8 +3295,8 @@ static int read_block_group(demuxer_t *demuxer, int64_t end,
             break;
 
         case MATROSKA_ID_REFERENCEBLOCK:;
-            int64_t num = ebml_read_int(s);
-            if (num == EBML_INT_INVALID)
+            int64_t num;
+            if (!ebml_read_int(s, &num))
                 goto error;
             block->keyframe = false;
             break;
@@ -3314,8 +3344,9 @@ static int read_next_block_into_queue(demuxer_t *demuxer)
             int64_t start_filepos = stream_tell(s);
             switch (ebml_read_id(s)) {
             case MATROSKA_ID_TIMECODE: {
-                uint64_t num = ebml_read_uint(s);
-                if (num == EBML_UINT_INVALID)
+                uint64_t num;
+                // Block timestamps add up to INT16_MAX ticks to this.
+                if (!ebml_read_uint(s, &num) || num > INT64_MAX / mkv_d->tc_scale - INT16_MAX)
                     goto find_next_cluster;
                 mkv_d->cluster_tc = num * mkv_d->tc_scale;
                 break;
@@ -3500,12 +3531,15 @@ static struct mkv_index *seek_with_cues(struct demuxer *demuxer, int seek_id,
 {
     struct mkv_demuxer *mkv_d = demuxer->priv;
     struct mkv_index *index = NULL;
+    bool covered = false;
 
     int64_t min_diff = INT64_MIN;
     for (size_t i = 0; i < mkv_d->num_indexes; i++) {
         if (seek_id < 0 || mkv_d->indexes[i].tnum == seek_id) {
             int64_t diff =
                 mkv_d->indexes[i].timecode * mkv_d->tc_scale - target_timecode;
+            if (diff <= 0)
+                covered = true;
             if (flags & SEEK_FORWARD)
                 diff = -diff;
             if (min_diff != INT64_MIN) {
@@ -3522,7 +3556,13 @@ static struct mkv_index *seek_with_cues(struct demuxer *demuxer, int seek_id,
 
     if (index) {        /* We've found an entry. */
         uint64_t seek_pos = index->filepos;
-        if (flags & SEEK_HR) {
+        mkv_d->skip_to_timecode = index->timecode * mkv_d->tc_scale;
+        if (!covered) {
+            // No entry is at or before the target, the start of the file
+            // is the only position that is.
+            seek_pos = mkv_d->first_cluster;
+            mkv_d->skip_to_timecode = INT64_MIN;
+        } else if (flags & SEEK_HR) {
             // Find the cluster with the highest filepos, that has a timestamp
             // still lower than min_tc.
             double secs = mkv_d->opts->subtitle_preroll_secs;
@@ -3531,7 +3571,7 @@ static struct mkv_index *seek_with_cues(struct demuxer *demuxer, int seek_id,
             double pre_f = secs * 1e9 / mkv_d->tc_scale;
             int64_t pre = pre_f >= (double)INT64_MAX ? INT64_MAX : (int64_t)pre_f;
             int64_t min_tc = pre < index->timecode ? index->timecode - pre : 0;
-            uint64_t prev_target = 0;
+            uint64_t prev_target = mkv_d->first_cluster;
             int64_t prev_tc = 0;
             for (size_t i = 0; i < mkv_d->num_indexes; i++) {
                 if (seek_id < 0 || mkv_d->indexes[i].tnum == seek_id) {
@@ -3559,8 +3599,7 @@ static struct mkv_index *seek_with_cues(struct demuxer *demuxer, int seek_id,
                 }
                 prev_target = target;
             }
-            if (prev_target)
-                seek_pos = prev_target;
+            seek_pos = prev_target;
         }
 
         mkv_d->cluster_end = 0;
@@ -3615,12 +3654,8 @@ static void demux_mkv_seek(demuxer_t *demuxer, double seek_pts, int flags)
         if (!index)
             stream_seek(demuxer->stream, old_pos);
 
-        if (flags & SEEK_FORWARD) {
+        if (flags & SEEK_FORWARD)
             mkv_d->skip_to_timecode = target_timecode;
-        } else {
-            mkv_d->skip_to_timecode = index ? index->timecode * mkv_d->tc_scale
-                                            : INT64_MIN;
-        }
     } else {
         stream_t *s = demuxer->stream;
 

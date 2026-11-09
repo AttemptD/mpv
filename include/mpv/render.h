@@ -49,6 +49,7 @@ extern "C" {
  * Supported backends
  * ------------------
  *
+ * Direct3D 11: via MPV_RENDER_API_TYPE_D3D11, see render_d3d11.h header.
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
@@ -213,8 +214,9 @@ typedef enum mpv_render_param_type {
      * Control surface depth. Valid for mpv_render_context_render().
      * Type: int*
      * This implies the depth of the surface passed to the render function in
-     * bits per channel. If omitted or set to 0, the renderer will assume 8.
-     * Typically used to control dithering.
+     * bits per channel. If omitted or set to 0, the renderer will use the
+     * depth of the texture format with the Direct3D 11 backend, and assume 8
+     * otherwise. Typically used to control dithering.
      */
     MPV_RENDER_PARAM_DEPTH = 5,
     /**
@@ -423,6 +425,19 @@ typedef enum mpv_render_param_type {
      */
     MPV_RENDER_PARAM_SW_POINTER = 20,
     /**
+     * Required parameters for initializing the Direct3D 11 renderer. Valid
+     * for mpv_render_context_create().
+     * Type: mpv_d3d11_init_params*
+     */
+    MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21,
+    /**
+     * Describes a D3D11 render target. Valid for mpv_render_context_render().
+     * Type: mpv_d3d11_fbo*
+     */
+    MPV_RENDER_PARAM_D3D11_FBO = 22,
+    /**
+     * Afuse Apple extensions use a private range, separate from upstream IDs.
+     *
      * The name of the render backend to use. Valid for mpv_render_context_create().
      *
      * Type: char*
@@ -431,25 +446,25 @@ typedef enum mpv_render_param_type {
      *   "gpu" (default)
      *   "gpu-next"
      */
-    MPV_RENDER_PARAM_BACKEND = 21,
+    MPV_RENDER_PARAM_BACKEND = 1001,
     /**
      * Afuse iOS gpu-next target: mpv_render_target_color*. Passed per render.
      * Omission preserves sRGB output. Linear BT.2020 uses RGBA16F with
      * 1.0 = 203 cd/m2, for a CAMetalLayer with matching EDR metadata.
      */
-    MPV_RENDER_PARAM_TARGET_COLOR = 22,
+    MPV_RENDER_PARAM_TARGET_COLOR = 1002,
     /** Afuse gpu-next: writes mpv_render_dovi_status after a successful render. */
-    MPV_RENDER_PARAM_DOVI_STATUS = 23,
+    MPV_RENDER_PARAM_DOVI_STATUS = 1003,
     /** Afuse CPU HDR output: mpv_render_sw_p010*, with MPV_RENDER_PARAM_SW_SIZE.
      * Preserves BT.2020/PQ luminance in a 10-bit video-range bi-planar buffer.
      */
-    MPV_RENDER_PARAM_SW_P010 = 24,
+    MPV_RENDER_PARAM_SW_P010 = 1004,
     /** Afuse Apple extension: mpv_render_apple_frame, see below. */
-    MPV_RENDER_PARAM_APPLE_FRAME = 25,
+    MPV_RENDER_PARAM_APPLE_FRAME = 1005,
     /** Afuse P7 reconstruction input, mpv_render_apple_p7_frame*. No frame is
      * consumed if validation or metadata conversion fails. Requires the same
      * mapping permission as APPLE_FRAME. The host MUST compose before display. */
-    MPV_RENDER_PARAM_APPLE_P7_FRAME = 26,
+    MPV_RENDER_PARAM_APPLE_P7_FRAME = 1006,
 } mpv_render_param_type;
 
 typedef struct mpv_render_target_color {
@@ -565,6 +580,8 @@ typedef struct mpv_render_param {
 /**
  * Predefined values for MPV_RENDER_PARAM_API_TYPE.
  */
+// See render_d3d11.h
+#define MPV_RENDER_API_TYPE_D3D11 "d3d11"
 // See render_gl.h
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
 // See section "Software renderer"

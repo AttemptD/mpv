@@ -163,10 +163,19 @@ struct mp_osd_render_opts {
 
 struct mp_bluray_opts {
     char *bluray_device;
+    char *keyfile;
     int angle;
+    int min_title_length;
+    int region;
+    int uo_restriction;
     int64_t remote_cache_size;
     int64_t remote_prefetch_size;
     bool remote_fast_open;
+};
+
+struct dvda_opts {
+    char *device;
+    int page;
 };
 
 typedef struct MPOpts {
@@ -260,6 +269,7 @@ typedef struct MPOpts {
     int hls_bitrate;
     int edition_id;
     bool flatten_editions;
+    bool disc_menu;
     bool show_dependent_tracks;
     bool initial_audio_sync;
     double sync_max_video_change;
@@ -425,6 +435,7 @@ typedef struct MPOpts {
     struct wingl_opts *wingl_opts;
     struct cuda_opts *cuda_opts;
     struct dvd_opts *dvd_opts;
+    struct dvda_opts *dvda_opts;
     struct vaapi_opts *vaapi_opts;
     struct sws_opts *sws_opts;
     struct zimg_opts *zimg_opts;

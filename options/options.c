@@ -57,7 +57,6 @@ static void print_version(struct mp_log *log)
     mp_print_version(log, true);
 }
 
-extern const struct m_sub_options tv_params_conf;
 extern const struct m_sub_options stream_bluray_conf;
 extern const struct m_sub_options stream_cdda_conf;
 extern const struct m_sub_options stream_dvb_conf;
@@ -94,6 +93,7 @@ extern const struct m_obj_list vo_obj_list;
 extern const struct m_sub_options ao_conf;
 
 extern const struct m_sub_options dvd_conf;
+extern const struct m_sub_options dvda_conf;
 extern const struct m_sub_options clipboard_conf;
 extern const struct m_sub_options curl_conf;
 
@@ -591,8 +591,12 @@ static const m_option_t mp_opts[] = {
 #if HAVE_DVDNAV
     {"dvd", OPT_SUBSTRUCT(dvd_opts, dvd_conf)},
 #endif
+#if HAVE_DVDA
+    {"dvda", OPT_SUBSTRUCT(dvda_opts, dvda_conf)},
+#endif
     {"edition", OPT_CHOICE(edition_id, {"auto", -1}), M_RANGE(0, 8190)},
     {"flatten-editions", OPT_BOOL(flatten_editions)},
+    {"disc-menu", OPT_BOOL(disc_menu)},
     {"show-dependent-tracks", OPT_BOOL(show_dependent_tracks)},
 #if HAVE_LIBBLURAY
     {"bluray", OPT_SUBSTRUCT(stream_bluray_opts, stream_bluray_conf)},
@@ -915,8 +919,10 @@ static const m_option_t mp_opts[] = {
 #endif
     {"input-terminal", OPT_BOOL(consolecontrols), .flags = UPDATE_TERM},
 
+#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     {"input-ipc-server", OPT_STRING(ipc_path), .flags = M_OPT_FILE},
     {"input-ipc-client", OPT_STRING(ipc_client)},
+#endif
 
     {"screenshot", OPT_SUBSTRUCT(screenshot_image_opts, screenshot_conf)},
     {"screenshot-template", OPT_STRING(screenshot_template)},
@@ -1096,9 +1102,9 @@ static const struct MPOpts mp_default_opts = {
         NULL
     },
     .audio_exts = (char *[]){
-        "aac", "ac3", "aiff", "ape", "au", "dts", "eac3", "flac", "m4a", "mka",
-        "mp1", "mp2", "mp3", "mpc", "oga", "ogg", "ogm", "opus", "tak", "thd",
-        "tta", "wav", "wma", "wv", NULL
+        "aac", "ac3", "aiff", "ape", "au", "dff", "dsf", "dts", "eac3", "flac",
+        "m4a", "mka", "mp1", "mp2", "mp3", "mpc", "oga", "ogg", "ogm", "opus",
+        "tak", "thd", "tta", "wav", "wma", "wv", NULL
     },
     .image_exts = (char *[]){
         "avif", "bmp", "gif", "heic", "heif", "j2k", "jp2", "jpeg", "jpg",

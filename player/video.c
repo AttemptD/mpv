@@ -205,7 +205,7 @@ err_out:
     if (track->sink)
         mp_pin_disconnect(track->sink);
     track->sink = NULL;
-    error_on_track(mpctx, track);
+    track->dec_failed = true;
     return 0;
 }
 
@@ -225,6 +225,46 @@ static void filter_update_subtitles(void *ctx, double pts)
 
     if (osd_get_render_subs_in_filter(mpctx->osd))
         update_subtitles(mpctx, pts);
+}
+
+// Create the track's decoder and connect it to the filter chain.
+static bool vo_chain_init_decoder(struct MPContext *mpctx, struct vo_chain *vo_c)
+{
+    struct track *track = vo_c->track;
+    if (!init_video_decoder(mpctx, track))
+        return false;
+    vo_c->dec_src = track->dec->f->pins[0];
+    vo_c->filter->container_fps =
+        mp_decoder_wrapper_get_container_fps(track->dec);
+    if (vo_c->is_coverart)
+        mp_decoder_wrapper_set_coverart_flag(track->dec, true);
+    mp_pin_connect(vo_c->filter->f->pins[0], vo_c->dec_src);
+    return true;
+}
+
+// Destroy the track's decoder, keeping the filter chain, the VO and the
+// displayed frame. The chain stays at EOF until reinit_video_decoder().
+void uninit_video_decoder(struct MPContext *mpctx)
+{
+    struct vo_chain *vo_c = mpctx->vo_chain;
+    struct track *track = vo_c->track;
+    mp_assert(track && track->dec);
+    talloc_free(track->dec->f);
+    track->dec = NULL;
+    vo_c->dec_src = NULL;
+}
+
+// Create a new decoder for the track and restart the chain with it.
+void reinit_video_decoder(struct MPContext *mpctx)
+{
+    struct vo_chain *vo_c = mpctx->vo_chain;
+    mp_assert(vo_c->track && !vo_c->track->dec);
+    // init_video_decoder() deselects the track and destroys the chain on failure.
+    if (!vo_chain_init_decoder(mpctx, vo_c))
+        return;
+    // The filter chain still holds the old decoder's EOF.
+    mp_filter_reset(vo_c->filter->f);
+    reset_video_state(mpctx);
 }
 
 // (track=NULL creates a blank chain, used for lavfi-complex)
@@ -265,22 +305,10 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
     if (track) {
         vo_c->track = track;
         track->vo_c = vo_c;
-        if (!init_video_decoder(mpctx, track))
-            goto err_out;
-
-        vo_c->dec_src = track->dec->f->pins[0];
-        vo_c->filter->container_fps =
-            mp_decoder_wrapper_get_container_fps(track->dec);
         vo_c->is_coverart = !!track->attached_picture;
         vo_c->is_sparse = track->stream->still_image || vo_c->is_coverart;
-
-        if (vo_c->is_coverart)
-            mp_decoder_wrapper_set_coverart_flag(track->dec, true);
-
-        track->vo_c = vo_c;
-        vo_c->track = track;
-
-        mp_pin_connect(vo_c->filter->f->pins[0], vo_c->dec_src);
+        if (!vo_chain_init_decoder(mpctx, vo_c))
+            goto err_out;
     }
 
     update_vo_chain_el_pair(mpctx);
@@ -316,6 +344,7 @@ void mp_force_video_refresh(struct MPContext *mpctx)
 
     // If not paused, the next frame should come soon enough.
     if (opts->pause || mpctx->time_frame >= 0.5 ||
+        (vo_c->track && vo_c->track->image) ||
         mpctx->video_status == STATUS_EOF)
     {
         issue_refresh_seek(mpctx, MPSEEK_VERY_EXACT);
@@ -494,8 +523,13 @@ static int video_output_image(struct MPContext *mpctx, bool *logical_eof)
         *logical_eof = true;
         if (vo_has_frame(mpctx->video_out))
             return VD_EOF;
-        hrseek = false;
     }
+
+    // Sparse streams usually have no frame at the seek target, or rather we
+    // don't want to jump to next keyframe, when there is a lot of other stream
+    // data in between.
+    if (vo_c->is_sparse)
+        hrseek = false;
 
     if (have_new_frame(mpctx, false))
         return VD_NEW_FRAME;
@@ -602,14 +636,25 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
     struct MPOpts *opts = mpctx->opts;
     struct vo *vo = mpctx->video_out;
 
-    if (mpctx->video_status < STATUS_READY) {
+    // First frame after a reset while audio is already playing: the chain was
+    // started mid-playback (track switch, disc stream delivering again), or a
+    // sparse stream's frame was held through the restart. delay is zero from
+    // the reset and the frame would be shown right away. Set it to the audio
+    // written past the frame's pts, so the audio sync below shows the frame
+    // at its time like any later one.
+    bool first_frame = mpctx->video_pts == MP_NOPTS_VALUE;
+    if (first_frame && mpctx->audio_status == STATUS_PLAYING) {
+        double apts = written_audio_pts(mpctx);
+        double pts = mpctx->next_frames[0]->pts;
+        if (apts != MP_NOPTS_VALUE && pts != MP_NOPTS_VALUE)
+            mpctx->delay = apts + opts->audio_delay - pts;
+    }
+
+    if (mpctx->video_status < STATUS_READY && mpctx->audio_status != STATUS_PLAYING) {
         mpctx->time_frame = 0;
     } else if (mpctx->display_sync_active || vo->opts->video_sync == VS_NONE) {
         // don't touch the timing
-    } else if (mpctx->audio_status == STATUS_PLAYING &&
-               mpctx->video_status == STATUS_PLAYING &&
-               !ao_untimed(mpctx->ao))
-    {
+    } else if (mpctx->audio_status == STATUS_PLAYING && !ao_untimed(mpctx->ao)) {
         double buffered_audio = ao_get_delay(mpctx->ao);
 
         double predicted = mpctx->delay / mpctx->video_speed +
@@ -617,7 +662,7 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
         double difference = buffered_audio - predicted;
         MP_STATS(mpctx, "value %f audio-diff", difference);
 
-        if (opts->autosync) {
+        if (opts->autosync && !first_frame) {
             /* Smooth reported playback position from AO by averaging
              * it with the value expected based on previous value and
              * time elapsed since then. May help smooth video timing
@@ -812,7 +857,7 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
 
     mpctx->display_sync_active = false;
 
-    if (!VS_IS_DISP(mode) || !vo_is_visible(vo))
+    if (!VS_IS_DISP(mode) || !vo_is_visible(vo) || mpctx->vo_chain->is_sparse)
         return;
 
     bool resample = mode == VS_DISP_RESAMPLE || mode == VS_DISP_RESAMPLE_VDROP ||
@@ -1059,8 +1104,11 @@ void write_video(struct MPContext *mpctx)
     if (mpctx->paused && mpctx->video_status >= STATUS_READY)
         return;
 
+    // Once the chain reached EOF nothing is read from it again.
     bool logical_eof = false;
-    int r = video_output_image(mpctx, &logical_eof);
+    int r = VD_EOF;
+    if (mpctx->video_status < STATUS_DRAINING)
+        r = video_output_image(mpctx, &logical_eof);
     MP_TRACE(mpctx, "video_output_image: r=%d/eof=%d/st=%s\n", r, logical_eof,
              mp_status_str(mpctx->video_status));
 
@@ -1099,7 +1147,9 @@ void write_video(struct MPContext *mpctx)
             if (vo_c->is_sparse && !mpctx->ao_chain) {
                 MP_VERBOSE(mpctx, "assuming this is an image\n");
                 mpctx->time_frame += opts->image_display_duration / opts->playback_speed;
-            } else if (mpctx->last_frame_duration > 0) {
+            } else if (mpctx->last_frame_duration > 0 && !opts->untimed &&
+                       !(vo->driver->caps & VO_CAP_UNTIMED))
+            {
                 MP_VERBOSE(mpctx, "using demuxer frame duration for last frame\n");
                 mpctx->time_frame += mpctx->last_frame_duration;
             } else {
@@ -1132,12 +1182,23 @@ void write_video(struct MPContext *mpctx)
         return;
     }
 
-    if (mpctx->video_status > STATUS_PLAYING)
-        mpctx->video_status = STATUS_PLAYING;
-
     if (r != VD_NEW_FRAME) {
         mp_wakeup_core(mpctx); // Decode more in next iteration.
         return;
+    }
+
+    // A sparse still-image stream may have no frame at the seek target.
+    // Complete the restart without showing it.
+    if (vo_c->is_sparse && mpctx->video_status < STATUS_READY) {
+        double ref = mpctx->playback_pts != MP_NOPTS_VALUE
+                        ? mpctx->playback_pts : mpctx->last_seek_pts;
+        if (ref != MP_NOPTS_VALUE && mpctx->next_frames[0]->pts > ref + 1.0) {
+            MP_VERBOSE(mpctx, "sparse video: frame %f is ahead of %f, not "
+                       "showing it for the restart\n",
+                       mpctx->next_frames[0]->pts, ref);
+            mpctx->video_status = STATUS_READY;
+            return;
+        }
     }
 
     if (logical_eof && !mpctx->num_past_frames && mpctx->num_next_frames == 1 &&

@@ -11,6 +11,16 @@ Track Selection
     will be used. A track that matches more subtags will be preferred over one
     that matches fewer. See also ``--aid``.
 
+    On a disc the list is also handed to the disc's own selection logic. A DVD
+    register holds a single two-letter ISO 639-1 code, so only the first
+    two-letter entry is used and longer ones are skipped. Blu-ray takes one
+    three-letter code, picked by matching the whole list against the disc.
+    Either way this only affects what the disc itself picks, mpv's own track
+    selection always uses the whole list.
+
+    ``--slang`` additionally chooses the DVD menu language. Discs that carry
+    only one menu language ignore it.
+
     This is a string list option. See `List Options`_ for details.
 
     .. admonition:: Examples
@@ -40,9 +50,10 @@ Track Selection
     This is a string list option. See `List Options`_ for details.
 
 ``--aid=<ID|auto|no>``
-    Select audio track. ``auto`` selects the default, ``no`` disables audio.
-    See also ``--alang``. mpv normally prints available audio tracks on the
-    terminal when starting playback of a file.
+    Select audio track. ``auto`` selects the default, or the next best track
+    if the default fails to initialize. ``no`` disables audio. See also
+    ``--alang``. mpv normally prints available audio tracks on the terminal
+    when starting playback of a file.
 
     ``--audio`` is an alias for ``--aid``.
 
@@ -97,14 +108,16 @@ Track Selection
 
 ``--sid=<ID|auto|no>``
     Display the subtitle stream specified by ``<ID>``. ``auto`` selects
-    the default, ``no`` disables subtitles.
+    the default, or the next best stream if the default fails to initialize.
+    ``no`` disables subtitles.
 
     ``--sub`` is an alias for ``--sid``.
 
     ``--sid=no`` or ``--sub=no`` disables subtitle decoding.
 
 ``--vid=<ID|auto|no>``
-    Select video channel. ``auto`` selects the default, ``no`` disables video.
+    Select video channel. ``auto`` selects the default, or the next best track
+    if the default fails to initialize. ``no`` disables video.
 
     ``--video`` is an alias for ``--vid``.
 
@@ -553,7 +566,8 @@ Playback Control
     Stop playback if either audio or video fails to initialize (default: no).
     With ``no``, playback will continue in video-only or audio-only mode if one
     of them fails. This doesn't affect playback of audio-only or video-only
-    files.
+    files. If the automatically selected track fails to initialize, the next
+    best track is tried before this option takes effect.
 
 ``--play-direction=<forward|+|backward|->``
     Control the playback direction (default: forward). Setting ``backward``
@@ -1044,15 +1058,18 @@ Program Behavior
 
         I have no idea.
 
-``--ytdl-format=<|ytdl|best|worst|mp4|webm|...>``
+``--ytdl-format=<ytdl|best|worst|mp4|webm|...>``
     Format selection string that is directly passed to youtube-dl.
     The possible values are specific to the website and the video, for a given
     URL the available formats can be found with the command
     ``youtube-dl -F URL``. See youtube-dl's documentation for available aliases.
-    (Default: empty)
+    (Default: ``bestvideo*+bestaudio/bestvideo+bestaudio/best``)
 
-    An empty value or ``ytdl`` does not pass a ``--format`` option to youtube-dl
-    at all, and thus uses its default format selection behavior.
+    The default selects the best separate video and audio tracks with a muxed
+    fallback.
+
+    The ``ytdl`` value does not pass a ``--format`` option to youtube-dl at
+    all, and thus does not override its default.
 
 ``--ytdl-raw-options=<key>=<value>[,<key>=<value>[,...]]``
     Pass arbitrary options to youtube-dl. Parameter and argument should be
@@ -2132,11 +2149,16 @@ Audio
     List of codecs for which compressed audio passthrough should be used. This
     works for both classic S/PDIF and HDMI.
 
-    Possible codecs are ``ac3``, ``dts``, ``dts-hd``, ``eac3``, ``truehd``.
-    Multiple codecs can be specified by separating them with ``,``. ``dts``
-    refers to low bitrate DTS core, while ``dts-hd`` refers to DTS MA (receiver
-    and OS support varies). If both ``dts`` and ``dts-hd`` are specified, it
-    behaves equivalent to specifying ``dts-hd`` only.
+    Possible codecs are ``ac3``, ``dts``, ``dts-hd``, ``eac3``, ``truehd``,
+    ``dsd``. Multiple codecs can be specified by separating them with ``,``.
+    ``dts`` refers to low bitrate DTS core, while ``dts-hd`` refers to DTS MA
+    (receiver and OS support varies). If both ``dts`` and ``dts-hd`` are
+    specified, it behaves equivalent to specifying ``dts-hd`` only.
+
+    ``dsd`` enables bit-perfect passthrough of DSD audio, requires an audio
+    output with exclusive device access (currently ``wasapi``) and a DAC that
+    accepts DoP at the resulting PCM rate (176.4 kHz for DSD64, 352.8 kHz for
+    DSD128, and so on).
 
     In earlier mpv versions you could use ``--ad`` to force the spdif wrapper.
     This does not work anymore.
@@ -3917,6 +3939,21 @@ Window
 Disc Devices
 ------------
 
+``--disc-menu=<yes|no>``
+    When set, opening ``dvd://`` or ``bd://`` boots into the disc's interactive
+    menu instead of automatically playing the longest title (default: ``no``).
+    On DVD the disc's virtual machine runs either way, so the menu can be
+    reached at any time via the synthetic "Disc Menu" entry in the
+    editions/titles list, or with the ``discnav menu`` command. A Blu-ray only
+    has disc navigation when playback started in menu mode, so neither is
+    available for a plain ``bd://``.
+
+    Blu-ray discs whose menus are BD-J rather than HDMV additionally need a
+    Java runtime and libbluray's BD-J jar (``libbluray-j2se-<version>.jar``).
+    libbluray should be able to find them automatically, but their locations
+    can also be overridden with the ``JAVA_HOME`` and ``LIBBLURAY_CP``
+    environment variables.
+
 ``--cdda-device=<path>``
     Specify the CD device for CDDA playback. The default device path depends on
     the OS. See the `OPTICAL DRIVES`_ section.
@@ -3931,6 +3968,21 @@ Disc Devices
 
         ``mpv dvd:// --dvd-device=/path/to/dvd/``
 
+``--dvda-device=<path>``
+    Specify the DVD-Audio device or .iso filename for ``dvda://`` playback.
+    You can also specify a directory that contains files previously copied
+    directly from a DVD-Audio disc. The default device path depends on
+    the OS. See the `OPTICAL DRIVES`_ section.
+
+    .. admonition:: Example
+
+        ``mpv dvda:// --dvda-device=/path/to/dvda/``
+
+``--dvda-page=<-1|0-...>``
+    Force the still picture page shown during DVD-Audio playback, instead of
+    the page scheduled for the current playback position (default: -1, use
+    the scheduled page).
+
 ``--bluray-device=<path>``
     Specify the Blu-ray disc location. Must be a directory with Blu-ray
     structure. The default device path depends on the OS. See the
@@ -3939,6 +3991,38 @@ Disc Devices
     .. admonition:: Example
 
         ``mpv bd:// --bluray-device=/path/to/bd/``
+
+``--bluray-region=<auto|a|b|c>``
+    Blu-ray player region code (default: auto). ``auto`` leaves libbluray's
+    own default in place, which is region B. Only matters for discs whose
+    menus or BD-J code check the player region.
+
+``--bluray-uo-restriction=<auto|disabled|relaxed|safe|compliant>``
+    How strictly to enforce the disc's User Operation prohibition masks
+    (default: auto, which leaves libbluray's default of ``relaxed`` in place).
+
+    Discs use these masks to make warnings and trailers unskippable.
+    ``disabled`` executes every operation unconditionally and may break
+    playback on some discs, ``compliant`` obeys the disc fully, and the two
+    values in between trade compliance for usability.
+
+``--bluray-min-title-length=<seconds>``
+    Ignore Blu-ray titles (playlists) shorter than this when building the
+    title list (default: 0, list every title). Discs commonly carry a large
+    number of very short playlists used only by the disc menus, and those show
+    up as editions. Setting this to something like 180 hides them.
+
+    If no title is long enough, the whole list is used instead, so that a disc
+    is never left unplayable by this.
+
+    Note that the title list is what ``bd://<N>`` and ``--edition`` index
+    into, so changing this renumbers them. ``bd://mpls/<NNNNN>`` is unaffected.
+    The language preferences are also picked from the titles that survive the
+    filter.
+
+``--bluray-key-file=<path>``
+    Path to a ``KEYDB.cfg`` unit key database, passed to libbluray for AACS
+    decryption (default: unset, let libaacs use its own configured location).
 
 ``--bluray-remote-cache=<bytes>``
     Read-through cache for remote Blu-ray ISO block access (default: 32 MiB).
@@ -4001,6 +4085,11 @@ Disc Devices
     .. note::
 
         You need write access to the DVD device to change the speed.
+
+``--dvd-region=<auto|1-8>``
+    DVD player region code (default: auto). ``auto`` claims whichever regions
+    the disc itself allows, so region checks in the disc's own code pass.
+    Naming a region claims exactly that one.
 
 ``--dvd-angle=<ID>``
     Some DVDs contain scenes that can be viewed from multiple angles.
@@ -4532,6 +4621,11 @@ Input
 ``--input-builtin-drag-and-drop=<yes|no>``
     Enable the built-in drag-and-drop behavior (default: yes). Setting it to no
     disables the built-in drag-and-drop handling.
+
+    .. admonition:: Note (macOS)
+
+        This also affects the drag and drop behavior on the Dock Icon and
+        loading files from Finder, since both cases can't be distinguished.
 
 ``--input-cmdlist``
     Prints all commands that can be bound to keys.
@@ -7021,15 +7115,10 @@ them.
 
     Windows with ANGLE only.
 
-``--angle-renderer=<d3d9|d3d11|auto>``
-    Forces a specific renderer when using the ANGLE backend (default: auto). In
-    auto mode this will pick D3D11 for systems that support Direct3D 11 feature
-    level 9_3 or higher, and D3D9 otherwise. This option is mainly for
-    debugging purposes. Normally there is no reason to force a specific
-    renderer, though ``--angle-renderer=d3d9`` may give slightly better
-    performance on old hardware. Note that the D3D9 renderer only supports
-    OpenGL ES 2.0, so most extended OpenGL features will not work if this
-    renderer is selected (similar to ``--gpu-dumb-mode``).
+``--angle-renderer=<d3d11|auto>``
+    Forces a specific renderer when using the ANGLE backend (default: auto).
+    This option is mainly for debugging purposes. Normally there is no reason
+    to force a specific renderer.
 
     Windows with ANGLE only.
 
@@ -7628,8 +7717,7 @@ them.
 
     In ``auto`` mode (default), the reference white luminance is queried from
     the system. This is currently only supported on Windows. If the system does
-    not provide a value, 203 cd/m² is assumed. (``auto`` mode works only
-    with libplacebo >= 371)
+    not provide a value, 203 cd/m² is assumed.
 
     .. note::
 
@@ -7732,6 +7820,73 @@ them.
         Conceptually simpler than ST2094-40, and generally produces worse
         results.
 
+``--tone-mapping-knee-adaptation=<0.0..1.0>``
+    Controls how strongly the knee point adapts to the source scene average
+    brightness, relative to the target average in PQ space. A value of 1.0
+    fully adapts the source average to the target average, while 0.0 disables
+    adaptation. Defaults to 0.4.
+
+    Affects ``st2094-40``, ``st2094-10`` and ``spline``.
+    (``--vo=gpu-next`` only)
+
+``--tone-mapping-knee-minimum=<0.0..0.5>``
+    Sets the minimum knee point as a fraction of the PQ luminance range.
+    Limits how low the automatically determined knee point can be.
+    Defaults to 0.1. (``--vo=gpu-next`` only)
+
+``--tone-mapping-knee-maximum=<0.5..1.0>``
+    Sets the maximum knee point as a fraction of the PQ luminance range.
+    Limits how high the automatically determined knee point can be.
+    Defaults to 0.8. (``--vo=gpu-next`` only)
+
+``--tone-mapping-knee-default=<0.0..1.0>``
+    Sets the fallback knee point used when source scene average brightness
+    metadata is unavailable. Normally, the knee point is determined from
+    the source scene average instead. The value should be between
+    ``--tone-mapping-knee-minimum`` and ``--tone-mapping-knee-maximum``.
+    Defaults to 0.4. (``--vo=gpu-next`` only)
+
+``--tone-mapping-knee-offset=<0.5..2.0>``
+    Sets the knee point offset for ``bt.2390``. The ITU-R specification
+    defines 0.5 as the default, but libplacebo uses 1.0.
+    Defaults to 1.0. (``--vo=gpu-next`` only)
+
+``--tone-mapping-slope-tuning=<0.0..10.0>``
+    Controls how the slope of the ``spline`` curve is adjusted based on
+    the difference between source and target peaks. The tuning aims to
+    preserve a slope closer to 1.0 for small differences and approach
+    linear mapping for larger differences. Defaults to 1.5.
+    (``--vo=gpu-next`` only)
+
+``--tone-mapping-slope-offset=<0.0..1.0>``
+    Controls the slope adjustment of the ``spline`` curve, together with
+    ``--tone-mapping-slope-tuning``. Defaults to 0.2.
+    (``--vo=gpu-next`` only)
+
+``--tone-mapping-spline-contrast=<0.0..1.5>``
+    Controls the contrast of the ``spline`` curve. Higher values produce
+    a steeper curve, preserving midtone contrast at the cost of shadow
+    and highlight detail. Lower values produce a shallower curve,
+    preserving highlights at the cost of midtone contrast. Values above
+    1.0 can increase contrast beyond that of the source.
+    Defaults to 0.5. (``--vo=gpu-next`` only)
+
+``--tone-mapping-reinhard-contrast=<0.0..1.0>``
+    Sets the local contrast coefficient at the display peak for
+    ``reinhard``. A value of 0.5 makes reference white approximately
+    half as bright as when clipping. Defaults to 0.5.
+    (``--vo=gpu-next`` only)
+
+``--tone-mapping-linear-knee=<0.0..1.0>``
+    Sets the knee point for the legacy ``mobius`` and ``gamma`` curves,
+    which operate on linear light. Defaults to 0.3.
+    (``--vo=gpu-next`` only)
+
+``--tone-mapping-exposure=<0.0..10.0>``
+    Sets the linear exposure or gain applied by the ``linear`` curve.
+    Defaults to 1.0.
+    (``--vo=gpu-next`` only)
+
 ``--tone-mapping-param=<value>``
     Set tone mapping parameters. By default, this is set to the special string
     ``default``, which maps to an algorithm-specific default value. Ignored if
@@ -7763,6 +7918,9 @@ them.
         Specifies the knee point (in PQ space). Defaults to 0.30.
     st2094-10
         Specifies the contrast (slope) at the knee point. Defaults to 1.0.
+
+    This option only affects ``--vo=gpu``. For ``--vo=gpu-next``, use
+    ``--tone-mapping-*`` options instead.
 
 ``--inverse-tone-mapping``
     If set, allows inverse tone mapping (expanding dynamic range). Can be used
@@ -7889,6 +8047,19 @@ them.
     Users on low DPI displays (<= 100) may want to lower this value, while
     users on very high DPI displays ("retina") may want to increase it. (Only
     for ``vo=gpu-next``)
+
+``--hdr-mastering-clip=<0.0..1.0>``
+    Controls soft clipping of source values above the mastering display's peak
+    luminance when the mastering metadata is considered reliable. The effect
+    fades out as the measured scene luminance exceeds the mastering peak.
+    Defaults to 1.0. (``--vo=gpu-next`` only)
+
+``--hdr-film-strength=<0.0..2.0>``
+    Controls the strength of the film-like response during tone mapping. Higher
+    values whiten compressed highlights at the cost of saturation, while lower
+    values preserve their original chromaticity. Values above 1.0 increase the
+    effect further at the risk of clipping highlights. Defaults to 0.3.
+    (``--vo=gpu-next`` only)
 
 ``--use-embedded-icc-profile``
     Load the embedded ICC profile contained in media files such as PNG images.
