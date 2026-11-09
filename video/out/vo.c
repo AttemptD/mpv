@@ -1286,6 +1286,87 @@ void vo_seek_reset(struct vo *vo)
     mp_mutex_unlock(&in->lock);
 }
 
+static void prepare_decoder_reset(void *arg)
+{
+    void **args = arg;
+    struct vo *vo = args[0];
+    bool *prepared = args[1];
+    bool teardown = *(bool *)args[2];
+    // Direct Android Dolby Vision and legacy GPU MediaCodec retain one-shot
+    // Surface buffers across redraws. Leave non-Surface backends alone.
+    // A copied P7 base layer can still retain a MediaCodec enhancement layer.
+    // Its one-shot Surface buffers need the same pre-reset queue cleanup.
+    bool direct_dovi = vo->params &&
+                       vo->params->imgfmt == IMGFMT_MEDIACODEC &&
+                       vo->params->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION;
+    bool legacy_mediacodec = !strcmp(vo->driver->name, "gpu") &&
+                            vo->params &&
+                            vo->params->imgfmt == IMGFMT_MEDIACODEC;
+    // A BL/EL pair can already retain decoder buffers before the first pair
+    // configures the VO. Waiting for vo->params skips precisely that window.
+    if (!legacy_mediacodec &&
+        (strcmp(vo->driver->name, "gpu-next") ||
+         (!vo->opts->android_dovi_dual && !direct_dovi)))
+        return;
+
+    // A P7 queue can include future MediaCodec frames which were never copied
+    // to private GPU planes. Keeping that queue until a new frame arrives can
+    // map a flushed one-shot buffer during a subtitle/OSD redraw (observed
+    // immediately after an audio-enabled seek). Leave the last drawn window
+    // buffer intact, but drop queued hardware frames before codec flush.
+    bool release_current = teardown || legacy_mediacodec || direct_dovi;
+
+    if (!vo->params)
+        MP_DBG(vo, "Preparing P7 Surface queue before first VO configuration\n");
+
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    if (!release_current && vo->opts->android_dovi_dual && in->current_frame) {
+        // A copied/software BL can still have a hardware Surface EL. Do not
+        // change the retained-frame behavior for an entirely software pair.
+        for (int n = 0; n < in->current_frame->num_frames; n++) {
+            struct mp_image *img = in->current_frame->frames[n];
+            if (img && (img->imgfmt == IMGFMT_MEDIACODEC ||
+                        (img->enhancement_layer &&
+                         img->enhancement_layer->imgfmt == IMGFMT_MEDIACODEC)))
+                release_current = true;
+        }
+    }
+    forget_frames(vo);
+    reset_vsync_timings(vo);
+    if (release_current) {
+        talloc_free(in->current_frame);
+        in->current_frame = NULL;
+        in->request_redraw = false;
+        in->want_redraw = false;
+        vo->want_redraw = false;
+    }
+    mp_mutex_unlock(&in->lock);
+    vo->driver->control(vo, !legacy_mediacodec && release_current
+                           ? VOCTRL_PREPARE_DECODER_UNINIT : VOCTRL_RESET, NULL);
+    *prepared = true;
+    MP_DBG(vo, "Prepared Dolby Vision Surface queue before decoder %s\n",
+           teardown ? "uninit" : "reset");
+}
+
+bool vo_prepare_decoder_reset(struct vo *vo)
+{
+    bool prepared = false, teardown = false;
+    void *args[] = {vo, &prepared, &teardown};
+    if (vo)
+        mp_dispatch_run(vo->in->dispatch, prepare_decoder_reset, args);
+    return prepared;
+}
+
+bool vo_prepare_decoder_uninit(struct vo *vo)
+{
+    bool prepared = false, teardown = true;
+    void *args[] = {vo, &prepared, &teardown};
+    if (vo)
+        mp_dispatch_run(vo->in->dispatch, prepare_decoder_reset, args);
+    return prepared;
+}
+
 // Whether at least 1 frame was queued or rendered since last seek or reconfig.
 bool vo_has_frame(struct vo *vo)
 {

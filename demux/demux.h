@@ -99,6 +99,7 @@ struct demux_opts {
 #define SEEK_HR       (1 << 5)      // hr-seek (this is a weak hint only)
 #define SEEK_BLOCK    (1 << 6)      // upon successfully queued seek, block readers
                                     // (simplifies syncing multiple reader threads)
+#define SEEK_UNCACHED (1 << 7)      // re-read source, do not reuse a partial cache
 
 // Strictness of the demuxer open format check.
 // demux.c will try by default: NORMAL, UNSAFE (in this order)
@@ -357,6 +358,8 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
                           double ref_pts, bool selected);
 void demuxer_refresh_track(struct demuxer *demuxer, struct sh_stream *stream,
                            double ref_pts);
+void demuxer_refresh_dependent_after_seek(struct demuxer *demuxer,
+                                         struct sh_stream *stream, double ref_pts);
 
 int demuxer_help(struct mp_log *log, const m_option_t *opt, struct bstr name);
 

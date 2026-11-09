@@ -1105,6 +1105,11 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         }
 
         if (el_ok) {
+            // EL contains NLQ residual codes, not limited-range display YUV.
+            // Normalize its storage by (2^sample_bits-1)/(2^code_bits-1),
+            // so code nlq_offset remains exactly neutral on both decode paths.
+            if (frame->repr.dovi && frame->repr.dovi->nlq_active)
+                fp->el_frame.repr.levels = PL_COLOR_LEVELS_FULL;
             pl_frame_set_chroma_location(&fp->el_frame, el_par.chroma_location);
             frame->enhancement_layer = &fp->el_frame;
         } else {
@@ -1199,6 +1204,12 @@ static void update_options(struct vo *vo)
 
     for (char **kv = p->next_opts->raw_opts; kv && kv[0]; kv += 2)
         pl_options_set_str(pars, kv[0], kv[1]);
+
+#if HAVE_EGL_ANDROID
+    // Read the current opt-in after raw options on every frame. A selected
+    // track can change P7 policy without recreating the existing VO.
+    pars->params.prefer_fel_float32 = vo->opts->android_dovi_dual;
+#endif
 }
 
 static void apply_target_contrast(struct priv *p, struct pl_color_space *color, float min_luma)
@@ -1416,6 +1427,21 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // Push all incoming frames into the frame queue
     for (int n = 0; n < frame->num_frames; n++) {
         int id = frame->frame_id + n;
+
+        // A seek/decoder reset retains current_frame for redraws. MediaCodec
+        // buffers already released to the Surface (or invalidated by flush)
+        // cannot be submitted again. Keep the old queue and mapper until a
+        // genuinely new frame arrives, as VOCTRL_RESET promises below.
+        // This also applies to a copied BL paired with a hardware Surface EL.
+        if (p->want_reset && id <= p->last_id &&
+            (frame->frames[n]->imgfmt == IMGFMT_MEDIACODEC ||
+             (frame->frames[n]->enhancement_layer &&
+              frame->frames[n]->enhancement_layer->imgfmt == IMGFMT_MEDIACODEC)) &&
+            frame->frames[n]->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION)
+        {
+            MP_DBG(vo, "Deferring MediaCodec queue reset for retained frame %d\n", id);
+            continue;
+        }
 
         if (p->want_reset) {
             pl_queue_reset(p->queue);
@@ -2232,6 +2258,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_RESET:
         // Defer until the first new frame (unique ID) actually arrives
         p->want_seek_reset = true;
+        return VO_TRUE;
+
+    case VOCTRL_PREPARE_DECODER_UNINIT:
+        // Unlike seek, teardown must release even the retained redraw frame
+        // before its MediaCodec owner is invalidated. Run on the VO thread.
+        pl_queue_reset(p->queue);
+        p->last_pts = 0.0;
+        p->last_id = 0;
+        p->flush_cache = true;
+        p->want_reset = false;
         return VO_TRUE;
 
     case VOCTRL_PERFORMANCE_DATA: {

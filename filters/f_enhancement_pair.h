@@ -20,6 +20,7 @@
 #include "filter.h"
 
 struct sh_stream;
+struct demuxer;
 
 // Maximum number of decoded frames the pairing filter retains while matching.
 #define MP_ENHANCEMENT_PAIR_QUEUE_MAX 8
@@ -38,4 +39,5 @@ struct sh_stream;
 // 1 input pin (BL frames), 1 output pin (paired BL frames). Returns NULL
 // on init failure. The caller should fall back to BL-only rendering.
 struct mp_filter *mp_enhancement_pair_create(struct mp_filter *parent,
-                                             struct sh_stream *el_sh);
+                                             struct sh_stream *el_sh,
+                                             struct demuxer *demuxer);

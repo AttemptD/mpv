@@ -57,6 +57,7 @@ enum {
 enum mp_voctrl {
     /* signal a device reset seek */
     VOCTRL_RESET = 1,
+    VOCTRL_PREPARE_DECODER_UNINIT,
     /* Handle input and redraw events, called by vo_check_events() */
     VOCTRL_CHECK_EVENTS,
     /* signal a device pause */
@@ -540,6 +541,9 @@ bool vo_has_frame(struct vo *vo);
 void vo_redraw(struct vo *vo);
 bool vo_want_redraw(struct vo *vo);
 void vo_seek_reset(struct vo *vo);
+// Drain the in-flight Android Dolby Vision draw before invalidating decoder buffers.
+bool vo_prepare_decoder_reset(struct vo *vo);
+bool vo_prepare_decoder_uninit(struct vo *vo);
 void vo_destroy(struct vo *vo);
 void vo_set_paused(struct vo *vo, bool paused);
 int64_t vo_get_drop_count(struct vo *vo);

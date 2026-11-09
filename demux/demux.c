@@ -4101,6 +4101,10 @@ static bool queue_seek(struct demux_internal *in, double seek_pts, int flags,
 
     bool require_cache = flags & SEEK_CACHED;
     flags &= ~(unsigned)SEEK_CACHED;
+    bool force_source = flags & SEEK_UNCACHED;
+    flags &= ~(unsigned)SEEK_UNCACHED;
+    if (force_source && require_cache)
+        return false;
 
     bool set_backwards = flags & SEEK_SATAN;
     flags &= ~(unsigned)SEEK_SATAN;
@@ -4109,7 +4113,9 @@ static bool queue_seek(struct demux_internal *in, double seek_pts, int flags,
     flags &= ~(unsigned)SEEK_BLOCK;
 
     struct demux_cached_range *cache_target =
-        find_cache_seek_range(in, seek_pts, flags);
+        force_source ? NULL : find_cache_seek_range(in, seek_pts, flags);
+    if (force_source)
+        MP_VERBOSE(in, "P7 composition seek: bypassing partial packet cache\n");
 
     if (!cache_target) {
         if (require_cache) {
@@ -4378,6 +4384,25 @@ void demuxer_refresh_track(struct demuxer *demuxer, struct sh_stream *stream,
     if (ds->selected) {
         update_stream_selection_state(in, ds);
         refresh_track(in, stream, ref_pts);
+    }
+    mp_mutex_unlock(&in->lock);
+}
+
+// A skipped Dolby enhancement stream may become necessary after a cached
+// seek. Normal video track switching suppresses this refresh after a seek,
+// but that stream has no cached packets: explicitly recover only its missing
+// packets using the existing overlap/deduplication mechanism.
+void demuxer_refresh_dependent_after_seek(struct demuxer *demuxer,
+                                         struct sh_stream *stream, double ref_pts)
+{
+    if (!stream || !stream->dependent_track || ref_pts == MP_NOPTS_VALUE)
+        return;
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    if (in->after_seek && stream->ds->selected) {
+        MP_VERBOSE(in, "Recovering dependent stream after cached seek at %.6f\n", ref_pts);
+        initiate_refresh_seek(in, stream->ds, MP_ADD_PTS(ref_pts, -in->ts_offset));
+        mp_cond_signal(&in->wakeup);
     }
     mp_mutex_unlock(&in->lock);
 }

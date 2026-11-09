@@ -34,6 +34,7 @@
 #include <libavutil/avstring.h>
 #include <libavutil/common.h>
 #include <libavutil/timecode.h>
+#include <libplacebo/utils/libav.h>
 
 #include "mpv_talloc.h"
 #include "client.h"
@@ -2144,6 +2145,9 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
     }
 
     bool has_crop = mp_rect_w(p.crop) > 0 && mp_rect_h(p.crop) > 0;
+    enum pl_color_transfer demux_transfer = p.color.transfer;
+    if (demux_transfer == PL_COLOR_TRC_UNKNOWN && p.lav_codecpar)
+        demux_transfer = pl_transfer_from_av(p.lav_codecpar->color_trc);
     struct m_sub_property props[] = {
         {"id",          SUB_PROP_INT(track->user_tid)},
         {"type",        SUB_PROP_STR(stream_type_name(track->type)),
@@ -2205,6 +2209,9 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
         {"demux-bitrate",  SUB_PROP_INT(p.bitrate), .unavailable = p.bitrate <= 0},
         {"demux-rotation", SUB_PROP_INT(p.rotate),  .unavailable = p.rotate <= 0},
         {"demux-par",      SUB_PROP_DOUBLE(par),    .unavailable = par <= 0},
+        {"demux-gamma",    SUB_PROP_STR(m_opt_choice_str(pl_csp_trc_names,
+                                                        demux_transfer)),
+                           .unavailable = demux_transfer == PL_COLOR_TRC_UNKNOWN},
         {"demux-duration", SUB_PROP_PTS(p.duration), .unavailable = p.duration <= 0},
         {"format-name", SUB_PROP_STR(p.format_name), .unavailable = !p.format_name},
         {"replaygain-track-peak", SUB_PROP_FLOAT(rg.track_peak),
@@ -6104,6 +6111,75 @@ static void cmd_seek(void *p)
         mpctx->add_osd_seek_info |= OSD_SEEK_INFO_TEXT;
 }
 
+#if HAVE_EGL_ANDROID
+// Change EL composition, not hwdec. In particular, a software decoder selected
+// by mpv's own hardware fallback is left alone. A plain option change cannot
+// destroy an existing EL decoder or release Surface-backed frames safely.
+static void cmd_android_p7_set_dual(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    bool enable = cmd->args[0].v.i != 0;
+    cmd->result = (mpv_node){.format = MPV_FORMAT_FLAG, .u.flag = true};
+    struct sh_stream *el = track && track->stream
+                          ? sh_stream_dependent_sibling(track->stream) : NULL;
+    bool paused = mpctx->opts->pause;
+    // Use the paused playback position, not a decoded/queued frame that may
+    // differ from the position exposed to the client after audio/video sync.
+    double pts = paused ? get_current_time(mpctx) : mpctx->video_pts;
+    if (pts == MP_NOPTS_VALUE)
+        pts = get_current_time(mpctx);
+    if (!mpctx->playback_initialized || !mpctx->vo_chain || !el ||
+        !track->stream->codec || track->stream->codec->dv_profile != 7 ||
+        !mpctx->demuxer || track->demuxer != mpctx->demuxer ||
+        mpctx->vo_chain->track != track || !mpctx->demuxer->seekable ||
+        pts == MP_NOPTS_VALUE || !isfinite(pts) || mpctx->stop_play ||
+        mpctx->seek.type != MPSEEK_NONE || mpctx->hrseek_active) {
+        cmd->success = false;
+        return;
+    }
+    if (enable == mpctx->opts->vo->android_dovi_dual)
+        return;
+
+    // Keep the OLD dual flag during teardown: the VO's quiesce helper needs
+    // it to release imported BL/EL codec buffers before decoder destruction.
+    bool old = mpctx->opts->vo->android_dovi_dual;
+    demux_block_reading(mpctx->demuxer, true);
+    uninit_video_chain(mpctx);
+    if (mp_property_do("android-dovi-dual", M_PROPERTY_SET, &enable, mpctx) <= 0) {
+        mp_property_do("android-dovi-dual", M_PROPERTY_SET, &old, mpctx);
+        cmd->success = false;
+    }
+    // update_vo_chain_el_pair deselects EL in base mode. Select it explicitly
+    // when retrying full mode; a preceding base-only session deselected it.
+    if (mpctx->opts->vo->android_dovi_dual)
+        demuxer_select_track(track->demuxer, el, pts, true);
+    reinit_video_chain(mpctx);
+    if (!mpctx->vo_chain) {
+        // Do not report a successful quality fallback when normal decoder
+        // initialization failed. Leave mpv's usual track-error handling intact,
+        // restore the option and never strand the demux reader behind a latch.
+        mp_property_do("android-dovi-dual", M_PROPERTY_SET, &old, mpctx);
+        demux_block_reading(mpctx->demuxer, false);
+        cmd->success = false;
+        return;
+    }
+    // Seek only after the new chain exists. This also unblocks demux readers,
+    // preventing the freshly created decoder from consuming an old mid-GOP.
+    // All advanced VO flags are off in base mode. Keep this explicit command's
+    // opt-in on this track, not on global options or the device model. New
+    // files get new tracks; ordinary/free playback never sets this marker.
+    track->android_p7_managed = true;
+    queue_seek(mpctx, MPSEEK_ABSOLUTE, pts,
+               paused ? MPSEEK_VERY_EXACT : MPSEEK_EXACT,
+               enable ? MPSEEK_FLAG_NO_CACHE : 0);
+    mp_wakeup_core(mpctx);
+    MP_INFO(mpctx, "P7 composition: %s at %.6f (hwdec unchanged)\n",
+            mpctx->opts->vo->android_dovi_dual ? "full" : "base", pts);
+}
+#endif
+
 static void cmd_revert_seek(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -7628,6 +7704,10 @@ static void cmd_notify_property(void *p)
 
 const struct mp_cmd_def mp_cmds[] = {
     { "ignore", cmd_ignore, .is_ignore = true, .is_noisy = true, },
+#if HAVE_EGL_ANDROID
+    { "android-p7-set-dual", cmd_android_p7_set_dual,
+        { {"enable", OPT_INT(v.i), M_RANGE(0, 1)} } },
+#endif
 
     { "seek", cmd_seek,
         {
@@ -8493,9 +8573,23 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
     if (flags & UPDATE_VO && mpctx->video_out) {
         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
         struct mp_pin *filter_src = mpctx->vo_chain ? mpctx->vo_chain->filter_src : NULL;
+        // Removing the video chain switches the playback clock to buffered
+        // audio. Preserve the visible paused P7 position before that happens,
+        // instead of resolving a relative zero seek after decoder teardown.
+        bool android_p7 = mp_android_p7_active(mpctx);
+        double paused_pts = opts->pause && android_p7
+                            ? get_current_time(mpctx) : MP_NOPTS_VALUE;
+        double resume_pts = android_p7
+                            ? get_current_time(mpctx) : MP_NOPTS_VALUE;
+        bool hold_packets = track && mpctx->demuxer && mpctx->demuxer->seekable &&
+                            resume_pts != MP_NOPTS_VALUE;
+        if (hold_packets)
+            demux_block_reading(mpctx->demuxer, true);
         uninit_video_out(mpctx);
         handle_force_window(mpctx, true);
-
+        // A freshly recreated P7 decoder must not consume packets from the
+        // old middle-of-GOP reader position before the recovery seek runs.
+        // mp_seek unblocks readers only after resetting the decoder/filter.
         if (filter_src) {
             reinit_video_chain_src(mpctx, NULL);
             if (mpctx->vo_chain) {
@@ -8505,9 +8599,16 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         } else {
             reinit_video_chain(mpctx);
         }
-
-        if (track || filter_src)
-            queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
+        if (track || filter_src) {
+            if (paused_pts != MP_NOPTS_VALUE) {
+                MP_DBG(mpctx, "Preserving paused P7 output position %.6f\n", paused_pts);
+                queue_seek(mpctx, MPSEEK_ABSOLUTE, paused_pts, MPSEEK_VERY_EXACT, 0);
+            } else if (hold_packets) {
+                queue_seek(mpctx, MPSEEK_ABSOLUTE, resume_pts, MPSEEK_EXACT, 0);
+            } else {
+                queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
+            }
+        }
 
         mp_wakeup_core(mpctx);
     }
@@ -8538,11 +8639,22 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
         struct mp_decoder_wrapper *dec = track ? track->dec : NULL;
         if (dec) {
+            double last_pts = mpctx->video_pts;
+            if (last_pts == MP_NOPTS_VALUE && opts->vo->android_dovi_dual)
+                last_pts = get_current_time(mpctx);
+            if (opts->vo->android_dovi_dual && mpctx->demuxer &&
+                mpctx->demuxer->seekable && last_pts != MP_NOPTS_VALUE)
+                demux_block_reading(mpctx->demuxer, true);
+            if (vo_prepare_decoder_reset(mpctx->video_out)) {
+                // Drop old frames still held by the player/filter chain too.
+                // Otherwise they can reach the VO after codec reinitialization
+                // but before the queued seek below is executed.
+                reset_playback_state(mpctx);
+            }
             mp_decoder_wrapper_control(dec, VDCTRL_REINIT, NULL);
             // filter chain might not change (which normally triggers this), but
             // hwdec will.
             mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
-            double last_pts = mpctx->video_pts;
             if (last_pts != MP_NOPTS_VALUE)
                 queue_seek(mpctx, MPSEEK_ABSOLUTE, last_pts, MPSEEK_EXACT, 0);
         }
@@ -8563,10 +8675,17 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
 
     if (flags & UPDATE_VD && mpctx->vo_chain) {
         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+        double paused_pts = opts->pause && opts->vo->android_dovi_dual
+                            ? get_current_time(mpctx) : MP_NOPTS_VALUE;
         uninit_video_chain(mpctx);
         reinit_video_chain(mpctx);
-        if (track)
-            queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
+        if (track) {
+            if (paused_pts != MP_NOPTS_VALUE) {
+                queue_seek(mpctx, MPSEEK_ABSOLUTE, paused_pts, MPSEEK_VERY_EXACT, 0);
+            } else {
+                queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
+            }
+        }
     }
 
     if (opt_ptr == &opts->vo->android_surface_size || opt_ptr == &opts->vo->d3d11_composition_size) {

@@ -172,6 +172,10 @@ static const m_option_t mp_vo_opt_list[] = {
     {"video-margin-ratio-top", OPT_FLOAT(margin_y[0]), M_RANGE(0.0, 1.0)},
     {"video-margin-ratio-bottom", OPT_FLOAT(margin_y[1]), M_RANGE(0.0, 1.0)},
     {"video-crop", OPT_RECT(video_crop), .flags = UPDATE_IMGPAR},
+#if HAVE_EGL_ANDROID
+    {"android-dovi-mel-fast", OPT_BOOL(android_dovi_mel_fast)},
+    {"android-dovi-dual", OPT_BOOL(android_dovi_dual)},
+#endif
     {"video-unscaled", OPT_CHOICE(unscaled,
         {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
     {"video-recenter", OPT_BOOL(recenter)},
@@ -250,6 +254,8 @@ static const m_option_t mp_vo_opt_list[] = {
 #endif
 #if HAVE_EGL_ANDROID
     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
+    {"android-hdr-output", OPT_BOOL(android_hdr_output)},
+    {"android-dovi-yuv", OPT_BOOL(android_dovi_yuv)},
 #endif
 #if HAVE_D3D11
     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
@@ -1027,7 +1033,10 @@ static const struct MPOpts mp_default_opts = {
     .osd_duration = 1000,
 #if HAVE_LUA
     .lua_load_osc = true,
-    .lua_load_ytdl = true,
+    // Android apps do not bundle executable yt-dlp/youtube-dl helpers. Failed
+    // media URLs should report their original error, not spawn missing helpers.
+    // Keep other Lua scripts (including app playback policy) enabled.
+    .lua_load_ytdl = !HAVE_ANDROID,
     .lua_ytdl_format = NULL,
     .lua_ytdl_raw_options = NULL,
     .lua_load_stats = true,

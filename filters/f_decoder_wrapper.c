@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 #include <libavutil/buffer.h>
 #include <libavutil/common.h>
@@ -163,10 +164,12 @@ struct priv {
     struct m_config_cache *opt_cache;
     struct dec_wrapper_opts *opts;
     struct dec_queue_opts *queue_opts;
+    bool limit_p7_surface_queue;
     struct mp_stream_info stream_info;
 
     struct mp_codec_params *codec;
     struct mp_decoder *decoder;
+    atomic_bool suspended;
 
     // Demuxer output.
     struct mp_pin *demux;
@@ -555,6 +558,24 @@ void mp_decoder_wrapper_set_extra_hw_frames(struct mp_decoder_wrapper *d, int n)
     mp_mutex_lock(&p->cache_lock);
     p->extra_hw_frames = n;
     mp_mutex_unlock(&p->cache_lock);
+}
+
+void mp_decoder_wrapper_set_suspended(struct mp_decoder_wrapper *d, bool suspended)
+{
+    struct priv *p = d->f->priv;
+    if (p->is_group) {
+        for (int i = 0; i < p->num_children; i++)
+            mp_decoder_wrapper_set_suspended(p->children[i], suspended);
+        return;
+    }
+    // Normal playback avoids dispatch locking. Only a suspension transition
+    // needs to synchronize with the optional decoder queue thread.
+    if (atomic_load(&p->suspended) == suspended)
+        return;
+    thread_lock(p);
+    atomic_store(&p->suspended, suspended);
+    mp_filter_wakeup(p->decf);
+    thread_unlock(p);
 }
 
 void mp_decoder_wrapper_set_frame_drops(struct mp_decoder_wrapper *d, int num)
@@ -1189,6 +1210,13 @@ static void update_queue_config(struct priv *p)
         .max_samples = p->queue_opts->max_samples,
         .max_duration = p->queue_opts->max_duration,
     };
+    // Native MediaCodec frames retain their finite output buffers until the
+    // VO presents them. A 50-frame async queue plus BL/EL pairing can exhaust
+    // those buffers and prevent the decoder thread from servicing controls.
+    // Bound only the opted-in P7 pair; do not rewrite the user's queue option
+    // or alter ordinary/free playback's buffering behavior.
+    if (p->limit_p7_surface_queue)
+        cfg.max_samples = MPMIN(cfg.max_samples, 2);
     mp_async_queue_set_config(p->queue, cfg);
 }
 
@@ -1199,6 +1227,9 @@ static void decf_process(struct mp_filter *f)
 
     if (m_config_cache_update(p->opt_cache))
         update_queue_config(p);
+
+    if (atomic_load(&p->suspended))
+        return;
 
     feed_packet(p);
     read_frame(p);
@@ -1373,6 +1404,7 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
 
     struct priv *p = public_f->priv;
     p->public.f = public_f;
+    atomic_init(&p->suspended, false);
 
     mp_mutex_init(&p->cache_lock);
     p->opt_cache = m_config_cache_alloc(p, public_f->global, &dec_wrapper_conf);
@@ -1414,6 +1446,18 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
     }
 
     if (p->queue_opts && p->queue_opts->use_queue) {
+#if HAVE_EGL_ANDROID
+        const struct mp_vo_opts *vo_opts =
+            mp_get_config_group(p, public_f->global, &vo_sub_opts);
+        struct sh_stream_group *group = src->group;
+        p->limit_p7_surface_queue = vo_opts->android_dovi_dual &&
+            src->type == STREAM_VIDEO && group && !group->lavfi_graph &&
+            group->num_members > 0 && group->members[0]->codec->dovi &&
+            group->members[0]->codec->dv_profile == 7;
+        if (p->limit_p7_surface_queue)
+            MP_VERBOSE(p, "P7 dual: capped async video queue at 2 Surface frames.\n");
+        talloc_free((void *)vo_opts);
+#endif
         p->queue = mp_async_queue_create();
         p->dec_dispatch = mp_dispatch_create(p);
         p->dec_root_filter = mp_filter_create_root(public_f->global);

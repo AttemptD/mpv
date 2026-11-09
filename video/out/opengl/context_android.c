@@ -28,7 +28,46 @@ struct priv {
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
+    bool hdr_active;
 };
+
+struct config_refine_ctx {
+    EGLDisplay display;
+    bool request_hdr;
+};
+
+static int refine_config(void *user_data, EGLConfig *configs, int num_configs)
+{
+    struct config_refine_ctx *refine = user_data;
+    if (!refine->request_hdr)
+        return 0;
+
+    // HDR10 output needs a 10-bit swapchain. Prefer RGB10_A2, but allow any
+    // config with at least 10 bits per color component.
+    for (int n = 0; n < num_configs; n++) {
+        EGLint r = 0, g = 0, b = 0;
+        eglGetConfigAttrib(refine->display, configs[n], EGL_RED_SIZE, &r);
+        eglGetConfigAttrib(refine->display, configs[n], EGL_GREEN_SIZE, &g);
+        eglGetConfigAttrib(refine->display, configs[n], EGL_BLUE_SIZE, &b);
+        if (r >= 10 && g >= 10 && b >= 10)
+            return n;
+    }
+
+    return 0;
+}
+
+static pl_color_space_t android_preferred_csp(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    return p->hdr_active ? pl_color_space_hdr10 : pl_color_space_srgb;
+}
+
+static bool android_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+{
+    if (params)
+        params->color = android_preferred_csp(ctx);
+    return true;
+}
 
 static void android_swap_buffers(struct ra_ctx *ctx)
 {
@@ -65,8 +104,15 @@ static bool android_init(struct ra_ctx *ctx)
         goto fail;
     }
 
+    struct config_refine_ctx refine = {
+        .display = p->egl_display,
+        .request_hdr = ctx->vo->opts->android_hdr_output,
+    };
     EGLConfig config;
-    if (!mpegl_create_context(ctx, p->egl_display, &p->egl_context, &config))
+    if (!mpegl_create_context_cb(ctx, p->egl_display, (struct mpegl_cb) {
+            .refine_config = refine_config,
+            .user_data = &refine,
+        }, &p->egl_context, &config))
         goto fail;
 
     ANativeWindow *native_window = vo_android_native_window(ctx->vo);
@@ -74,13 +120,40 @@ static bool android_init(struct ra_ctx *ctx)
     eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &format);
     ANativeWindow_setBuffersGeometry(native_window, 0, 0, format);
 
+    EGLint red_size = 0, green_size = 0, blue_size = 0;
+    eglGetConfigAttrib(p->egl_display, config, EGL_RED_SIZE, &red_size);
+    eglGetConfigAttrib(p->egl_display, config, EGL_GREEN_SIZE, &green_size);
+    eglGetConfigAttrib(p->egl_display, config, EGL_BLUE_SIZE, &blue_size);
+
+    const char *extensions = eglQueryString(p->egl_display, EGL_EXTENSIONS);
+    bool pq_supported = extensions &&
+        strstr(extensions, "EGL_EXT_gl_colorspace_bt2020_pq");
+    bool use_hdr = refine.request_hdr && pq_supported &&
+                   red_size >= 10 && green_size >= 10 && blue_size >= 10;
+    const EGLint hdr_attribs[] = {
+        EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_BT2020_PQ_EXT,
+        EGL_NONE,
+    };
+
     p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
-                                    (EGLNativeWindowType)native_window, NULL);
+        (EGLNativeWindowType)native_window, use_hdr ? hdr_attribs : NULL);
+
+    if (p->egl_surface == EGL_NO_SURFACE && use_hdr) {
+        MP_WARN(ctx, "Could not create BT.2020/PQ EGL surface; falling back to SDR.\n");
+        p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
+            (EGLNativeWindowType)native_window, NULL);
+        use_hdr = false;
+    }
 
     if (p->egl_surface == EGL_NO_SURFACE) {
         MP_FATAL(ctx, "Could not create EGL surface!\n");
         goto fail;
     }
+
+    p->hdr_active = use_hdr;
+    MP_INFO(ctx, "Android output colorspace: %s (%d/%d/%d-bit EGL)\n",
+            p->hdr_active ? "BT.2020/PQ HDR10" : "sRGB SDR",
+            red_size, green_size, blue_size);
 
     if (!eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface,
                         p->egl_context)) {
@@ -91,6 +164,8 @@ static bool android_init(struct ra_ctx *ctx)
     mpegl_load_functions(&p->gl, ctx->log);
 
     struct ra_ctx_params params = {
+        .preferred_csp = android_preferred_csp,
+        .set_color = android_set_color,
         .swap_buffers = android_swap_buffers,
     };
 

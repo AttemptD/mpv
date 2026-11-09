@@ -240,6 +240,9 @@ void step_frame_mute(struct MPContext *mpctx, bool mute)
 // Clear some playback-related fields on file loading or after seeks.
 void reset_playback_state(struct MPContext *mpctx)
 {
+    // Finish any Surface submission and stop queued old frames before the
+    // filter reset invalidates MediaCodec's output buffers.
+    vo_prepare_decoder_reset(mpctx->video_out);
     mp_filter_reset(mpctx->filter_root);
 
     reset_video_state(mpctx);
@@ -359,6 +362,17 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
         // The value is arbitrary, but should be "good enough" in most situations.
         if (hr_seek_very_exact)
             hr_seek_offset = MPMAX(hr_seek_offset, 0.5); // arbitrary
+        // Recreated BL and EL decoders have independent reference chains.
+        // A cue sufficient for BL can leave EL unable to produce the requested
+        // paused frame (observed 10.635 -> 11.136 with a 0.5s preroll). Start
+        // earlier on the opted-in dual path, then let the exact-seek/pairing
+        // code discard preroll. This changes neither the requested position
+        // nor ordinary/free/P5 seeks, and honors larger user-specified offsets.
+        struct track *video = mpctx->current_track[0][STREAM_VIDEO];
+        if (mp_android_p7_active(mpctx) && opts->vo->android_dovi_dual &&
+            video && video->stream &&
+            sh_stream_dependent_sibling(video->stream))
+            hr_seek_offset = MPMAX(hr_seek_offset, 2.0);
         for (int n = 0; n < mpctx->num_tracks; n++) {
             double offset = 0;
             if (!mpctx->tracks[n]->is_external)
@@ -377,8 +391,18 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
         demux_flags |= SEEK_CACHED;
 
     demux_flags |= SEEK_BLOCK;
+    if (seek.flags & MPSEEK_FLAG_NO_CACHE)
+        demux_flags |= SEEK_UNCACHED;
+
+    // Stop one-shot Surface redraws before a cached seek repositions packets.
+    // In particular EOF looping can otherwise schedule the old last frame
+    // while the decoder is about to flush, before reset_playback_state below.
+    vo_prepare_decoder_reset(mpctx->video_out);
 
     if (!demux_seek(mpctx->demuxer, demux_pts, demux_flags)) {
+        // A decoder reconfiguration may have held packet readers pending
+        // this seek. Failure must not leave the previous playback blocked.
+        demux_block_reading(mpctx->demuxer, false);
         if (!mpctx->demuxer->seekable) {
             MP_ERR(mpctx, "Cannot seek in this stream.\n");
             MP_ERR(mpctx, "You can force it with '--force-seekable=yes'.\n");

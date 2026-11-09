@@ -1,5 +1,6 @@
 #include "common/common.h"
 #include "formats.h"
+#include "utils.h"
 
 enum {
     // --- GL type aliases (for readability)
@@ -87,6 +88,12 @@ const struct gl_format gl_formats[] = {
     {"rgb16f",  GL_RGB16F,   GL_RGB,             T_FL,  F_F16 | F_TF | F_ES32 | F_EXTF16},
     {"rgba16f", GL_RGBA16F,  GL_RGBA,            T_FL,  F_F16 | F_CF | F_ES32 | F_EXTF16},
 
+    // float32 is optional on GLES. Probe the independent render/filter/blend
+    // extensions; needed to preserve FEL's zero code and 12-bit reconstruction.
+    {"r32f",    GL_R32F,     GL_RED,             T_FL,          F_CF | F_EXTF32},
+    {"rg32f",   GL_RG32F,    GL_RG,              T_FL,          F_CF | F_EXTF32},
+    {"rgba32f", GL_RGBA32F,  GL_RGBA,            T_FL,          F_CF | F_EXTF32},
+
     // On ES3.0+, 16 bit floats are texture-filterable.
     // Don't bother with 32 bit floats; they exist but are neither CR nor TF.
     {"r16f",    GL_R16F,     GL_RED,             T_FL,  F_F16 | F_TF | F_ES3},
@@ -121,6 +128,10 @@ int gl_format_feature_flags(GL *gl)
          | (gl->mpgl_caps & MPGL_CAP_EXT16 ? F_EXT16 : 0)
          | ((gl->es >= 300 &&
             (gl->mpgl_caps & MPGL_CAP_EXT_CR_HFLOAT)) ? F_EXTF16 : 0)
+         | ((gl->es >= 300 &&
+             (gl->es >= 320 || gl_check_extension(gl->extensions, "GL_EXT_color_buffer_float")) &&
+             gl_check_extension(gl->extensions, "GL_OES_texture_float_linear") &&
+             gl_check_extension(gl->extensions, "GL_EXT_float_blend")) ? F_EXTF32 : 0)
          | ((gl->version == 210 &&
             (gl->mpgl_caps & MPGL_CAP_ARB_FLOAT) &&
             (gl->mpgl_caps & MPGL_CAP_TEX_RG) &&

@@ -248,6 +248,7 @@ typedef struct lavc_ctx {
     struct mp_image_pool *hwdec_swpool;
 
     AVBufferRef *cached_hw_frames_ctx;
+    bool surface_eof_pending_reset;
 
     // --- The following fields are protected by dr_lock.
     mp_mutex dr_lock;
@@ -492,6 +493,8 @@ static AVBufferRef *hwdec_create_dev(struct mp_filter *vd,
             hwdec_devices_get_by_imgfmt_and_type(ctx->hwdec_devs, imgfmt,
                                                  hwdec->lavc_device);
 
+        if (hw_ctx && hw_ctx->create_stream_device)
+            return hw_ctx->create_stream_device(hw_ctx->create_stream_priv);
         if (hw_ctx && hw_ctx->av_device_ref)
             return av_buffer_ref(hw_ctx->av_device_ref);
     }
@@ -908,6 +911,7 @@ static void reset_avctx(struct mp_filter *vd)
     if (ctx->avctx && avcodec_is_open(ctx->avctx))
         avcodec_flush_buffers(ctx->avctx);
     ctx->flushing = false;
+    ctx->surface_eof_pending_reset = false;
     ctx->hwdec_request_reinit = false;
     // Wait for the first keyframe after reset to ensure the decoder state is
     // valid. Seeking should already jump to a keyframe, so this is safe.
@@ -1236,6 +1240,12 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
 
     prepare_decoding(vd);
 
+    // EOF may leave externally-backed MediaCodec frames in the render queues.
+    // A MediaCodec flush invalidates those buffers. Reset only when playback
+    // actually supplies a new packet (an explicit seek also resets normally).
+    if (pkt && ctx->surface_eof_pending_reset)
+        reset_avctx(vd);
+
     if (ctx->wait_for_keyframe > 0 && pkt) {
         if (!pkt->keyframe && !ctx->intra_only) {
             MP_DBG(vd, "Waiting for keyframe after reinit (dropping frame).\n");
@@ -1300,8 +1310,22 @@ static int decode_frame(struct mp_filter *vd)
             // start over in case we get new packets at some point in the future.
             // This must take the delay queue into account, so avctx returns EOF
             // until the delay queue has been drained.
-            if (!ctx->num_delay_queue)
-                reset_avctx(vd);
+            if (!ctx->num_delay_queue) {
+                // Shared-reader P5 and ordinary HW+ have the same one-shot
+                // output buffers as independently backed P7 BL/EL. Flushing
+                // at decoder EOF invalidates their not-yet-presented tail
+                // frames too, before the player reaches its own video EOF.
+                bool queued_surface = ctx->use_hwdec && !ctx->hwdec.copying &&
+                    ctx->hwdec.pix_fmt == AV_PIX_FMT_MEDIACODEC;
+                if (queued_surface) {
+                    if (!ctx->surface_eof_pending_reset)
+                        MP_VERBOSE(vd, "MediaCodec Surface EOF: retaining queued output "
+                                       "buffers until a seek or new packet.\n");
+                    ctx->surface_eof_pending_reset = true;
+                } else {
+                    reset_avctx(vd);
+                }
+            }
         } else if (ret == AVERROR(EAGAIN)) {
             // just retry after caller writes a packet
         } else {
@@ -1315,6 +1339,59 @@ static int decode_frame(struct mp_filter *vd)
     // If something was decoded successfully, it must return a frame with valid
     // data.
     mp_assert(ctx->pic->buf[0]);
+
+    // MediaCodec's external-surface frames do not carry hw_frames_ctx.
+    // Preserve the independent stream device so the GPU mapper can identify
+    // the matching AImageReader instead of reading the provider's idle queue.
+    if (ctx->pic->format == AV_PIX_FMT_MEDIACODEC && !ctx->pic->hw_frames_ctx &&
+        ctx->hwdec_dev &&
+        ((AVHWDeviceContext *)ctx->hwdec_dev->data)->user_opaque) {
+        // MediaCodec may omit chroma location on Surface frames. Preserve any
+        // explicit decoder/container value before applying P7's BL/EL VUI
+        // default (top-left, Dolby Profiles and Levels CCID 6). This is only
+        // the opted-in independent P7 Surface path, not ordinary HDR or P5.
+        if (ctx->codec->dovi && ctx->codec->dv_profile == 7 &&
+            ctx->pic->chroma_location == AVCHROMA_LOC_UNSPECIFIED) {
+            ctx->pic->chroma_location = avctx->chroma_sample_location;
+            // If the container has an explicit location, the decoder wrapper
+            // will merge it into the unspecified frame in its normal order.
+            if (ctx->pic->chroma_location == AVCHROMA_LOC_UNSPECIFIED &&
+                ctx->codec->chroma_location == PL_CHROMA_UNKNOWN)
+                ctx->pic->chroma_location = AVCHROMA_LOC_TOPLEFT;
+        }
+        if (!ctx->cached_hw_frames_ctx) {
+            ctx->cached_hw_frames_ctx = av_hwframe_ctx_alloc(ctx->hwdec_dev);
+            if (!ctx->cached_hw_frames_ctx) {
+                av_frame_unref(ctx->pic);
+                return AVERROR(ENOMEM);
+            }
+            AVHWFramesContext *frames = (void *)ctx->cached_hw_frames_ctx->data;
+            frames->format = AV_PIX_FMT_MEDIACODEC;
+            // HVCC may carry no SPS (parameters arrive in-band), leaving
+            // MediaCodec's avctx->profile unknown. HEVC DV profiles 5/7/8
+            // mandate 10-bit input; don't mislabel their external YUV as 8-bit.
+            bool dovi_10bit = ctx->codec->dovi &&
+                (ctx->codec->dv_profile == 5 || ctx->codec->dv_profile == 7 ||
+                 ctx->codec->dv_profile == 8);
+            frames->sw_format = avctx->codec_id == AV_CODEC_ID_HEVC &&
+                                (avctx->profile == AV_PROFILE_HEVC_MAIN_10 ||
+                                 dovi_10bit)
+                                ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+            frames->width = ctx->pic->width;
+            frames->height = ctx->pic->height;
+            int err = av_hwframe_ctx_init(ctx->cached_hw_frames_ctx);
+            if (err < 0) {
+                av_buffer_unref(&ctx->cached_hw_frames_ctx);
+                av_frame_unref(ctx->pic);
+                return err;
+            }
+        }
+        ctx->pic->hw_frames_ctx = av_buffer_ref(ctx->cached_hw_frames_ctx);
+        if (!ctx->pic->hw_frames_ctx) {
+            av_frame_unref(ctx->pic);
+            return AVERROR(ENOMEM);
+        }
+    }
 
     struct mp_image *mpi = mp_image_from_av_frame(ctx->pic);
     if (!mpi) {

@@ -84,6 +84,7 @@ enum seek_precision {
 enum seek_flags {
     MPSEEK_FLAG_DELAY = 1 << 0, // give player chance to coalesce multiple seeks
     MPSEEK_FLAG_NOFLUSH = 1 << 1, // keeping remaining data for seamless loops
+    MPSEEK_FLAG_NO_CACHE = 1 << 2, // newly enabled dependent stream needs fresh packets
 };
 
 struct seek_params {
@@ -102,6 +103,8 @@ struct frame_info {
 };
 
 struct track {
+    // File/track-local opt-in survives EL disable without changing free P7.
+    bool android_p7_managed;
     enum stream_type type;
 
     // Currently used for decoding.
@@ -690,6 +693,7 @@ bool disc_nav_mouse_pos_to_src(struct MPContext *mpctx, int src_w, int src_h,
                                int *out_x, int *out_y);
 
 // video.c
+bool mp_android_p7_active(struct MPContext *mpctx);
 void reset_video_state(struct MPContext *mpctx);
 int init_video_decoder(struct MPContext *mpctx, struct track *track);
 void uninit_video_decoder(struct MPContext *mpctx);

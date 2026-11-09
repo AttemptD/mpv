@@ -20,6 +20,10 @@ struct mp_hwdec_ctx {
 
     // libavutil-wrapped context, if available.
     struct AVBufferRef *av_device_ref; // AVHWDeviceContext*
+    // Some APIs bind the device to one decoder output queue. Request an
+    // independent stream device instead of sharing that queue (BL/EL).
+    struct AVBufferRef *(*create_stream_device)(void *priv);
+    void *create_stream_priv;
 
     // List of allowed IMGFMT_s, terminated with 0.
     // If NULL, all software formats are considered to be supported.

@@ -403,7 +403,8 @@ void mp_output_chain_set_vo(struct mp_output_chain *c, struct vo *vo)
 }
 
 void mp_output_chain_set_el_stream(struct mp_output_chain *c,
-                                   struct sh_stream *el_sh)
+                                   struct sh_stream *el_sh,
+                                   struct demuxer *demuxer)
 {
     struct chain *p = c->f->priv;
 
@@ -427,7 +428,7 @@ void mp_output_chain_set_el_stream(struct mp_output_chain *c,
     if (el_sh) {
         struct mp_user_filter *u = create_wrapper_filter(p);
         u->name = "el_pair";
-        u->f = mp_enhancement_pair_create(u->wrapper, el_sh);
+        u->f = mp_enhancement_pair_create(u->wrapper, el_sh, demuxer);
         if (!u->f) {
             MP_WARN(p, "Failed to set up enhancement-layer pairing.\n");
             talloc_free(u->wrapper);

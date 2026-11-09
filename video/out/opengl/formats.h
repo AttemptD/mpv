@@ -27,6 +27,7 @@ enum {
     F_APPL      = 1 << 8, // GL_APPLE_rgb_422
     F_GL2RG     = 1 << 9, // GL2.1-only with texture_rg (no float/FBO requirement)
     F_ES2RG     = 1 << 10, // ES2-only with GL_EXT_texture_rg
+    F_EXTF32    = 1 << 11, // GLES float32 color + linear filtering + blending
 
     // Feature flags. They are additional and signal presence of features.
     F_CR        = 1 << 16, // color-renderable

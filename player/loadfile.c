@@ -1665,8 +1665,23 @@ void update_vo_chain_el_pair(struct MPContext *mpctx)
     if (!mpctx->vo_chain || !mpctx->vo_chain->filter)
         return;
     struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    struct sh_stream *el = track
+                          ? sh_stream_dependent_sibling(track->stream) : NULL;
+#if HAVE_EGL_ANDROID
+    // Android dual-layer reconstruction is an explicit opt-in. A dependent
+    // stream discovered by the demuxer must not start a second decoder for
+    // ordinary/free playback, even if the renderer ignores its output.
+    if (!mpctx->opts->vo->android_dovi_dual && el) {
+        // Selecting BL automatically selects group-dependent streams too.
+        // Undo that for the unused EL so it cannot fill the demux cache.
+        demuxer_select_track(track->demuxer, el, MP_NOPTS_VALUE, false);
+        MP_VERBOSE(mpctx, "P7 dual disabled: enhancement stream not selected.\n");
+        el = NULL;
+    }
+#endif
     mp_output_chain_set_el_stream(mpctx->vo_chain->filter,
-        track ? sh_stream_dependent_sibling(track->stream) : NULL);
+        el,
+        track ? track->demuxer : NULL);
 }
 
 void update_lavfi_complex(struct MPContext *mpctx)

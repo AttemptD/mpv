@@ -4024,6 +4024,25 @@ Disc Devices
     Path to a ``KEYDB.cfg`` unit key database, passed to libbluray for AACS
     decryption (default: unset, let libaacs use its own configured location).
 
+``--bluray-remote-cache=<bytes>``
+    Read-through cache for remote Blu-ray ISO block access (default: 32 MiB).
+    libbluray often reads isolated 2 KiB UDF blocks; the cache fetches aligned
+    1 MiB chunks to reduce HTTP Range and SMB round trips. Set to ``0`` to
+    disable it. This option does not affect local ISO files or directories.
+
+``--bluray-remote-prefetch=<bytes>``
+    Sequentially cache the start of a remote Blu-ray ISO before handing it to
+    libbluray (default: 8 MiB). The final 1 MiB UDF anchor region is cached as
+    well. This avoids several high-latency backward HTTP Range or SMB seeks
+    during startup. The amount is capped by ``--bluray-remote-cache``; set it
+    to ``0`` to disable startup prefetch.
+
+``--bluray-remote-fast-open=<yes|no>``
+    Avoid building mpv's alternate-title/edition list for a remote ISO when
+    playing ``bd://longest`` or a direct ``bd://mpls/...`` playlist (default:
+    yes). Main-title detection and normal playback still use libbluray. Set to
+    ``no`` if selecting alternate Blu-ray titles from mpv is required.
+
 ``--cdda-...``
     These options can be used to tune the CD Audio reading feature of mpv.
 
@@ -7270,12 +7289,62 @@ them.
 
     Android with ``--gpu-context=android`` only.
 
+``--android-hdr-output=<yes|no>``
+    Request a 10-bit BT.2020/PQ EGL surface on Android. If a compatible
+    EGLConfig or ``EGL_EXT_gl_colorspace_bt2020_pq`` is unavailable, the
+    Android gpu context falls back to an SDR sRGB surface. (Default: no.)
+
+``--android-dovi-yuv=<yes|no>``
+    Experimental MediaCodec Dolby Vision raw-YUV bridge (default: no).
+    With ``hwdec=mediacodec``, ``vo=gpu-next`` and ``gpu-context=android``,
+    sample the hardware buffer using ``GL_EXT_YUV_target`` and split it into
+    three R16F textures on the GPU. This avoids the normal external texture's
+    YUV-to-RGB conversion and CPU copy-back, allowing libplacebo to apply the
+    frame's Dolby Vision metadata. Requires the local FFmpeg MediaCodec RPU
+    metadata patch, GLES 3, and renderable half-float textures.
+
+    Only frames with parsed Dolby Vision metadata use this path. Unsupported
+    devices or shader failures are reported as mapping errors; no RGB-based
+    Dolby Vision approximation is attempted. Use ``mediacodec-copy`` instead
+    on such devices. Reopen playback after changing this option.
+
+    Device support for 10-bit decoder buffers, color accuracy, and performance
+    must be verified. This does not implement Dolby Vision FEL reconstruction.
+
+``--android-dovi-dual=<yes|no>``
+    Experimental Android P7 dual-layer path (default: no). With
+    ``hwdec=mediacodec`` and ``vo=gpu-next``, allocate an independent hardware
+    decoder Surface for each stream. Pass the decoded device identity to the
+    GPU mapper and use raw YUV rather than the external texture's RGB conversion.
+    Active FEL reconstruction uses R32F input planes and float32 intermediates
+    to preserve 12-bit code precision. This does not request a native 12-bit
+    Dolby Vision display signal: the Android HDR output Surface remains 10-bit.
+
+    Requires GLES 3, ``GL_EXT_YUV_target``, renderable/linear float32 textures,
+    and the local FFmpeg MediaCodec RPU metadata patch. Unsupported hardware
+    causes decoder selection to try the normal fallback instead of producing
+    an unmappable Surface. Enable before opening a P7 track, and disable for
+    other tracks. This is separate from the P5 ``android-dovi-yuv`` option.
+    The ``android-dovi-mel-fast`` option may bypass EL only when the parsed RPU
+    confirms canonical zero-residual MEL; it never classifies FEL by P7 labels.
+
 ``--d3d11-composition-size=<WxH>``
     Set size of the output for d3d11 composition mode.
     When use composition mode, there is no window, must set the output size by
     the embedding application.
 
     Windows with ``--gpu-context=d3d11`` and  ``--d3d11-output-mode=composition`` only.
+
+``--android-dovi-mel-fast=<yes|no>``
+    Experimental zero-residual Dolby Vision MEL fast path (default: no).
+    Delay enhancement-layer decoder initialization until the base layer's
+    parsed RPU has been inspected. Canonical MEL frames carrying RPU on the
+    base layer can be rendered without decoding or uploading the enhancement
+    layer. The original path is retained for unknown metadata, EL-carried RPU,
+    and non-zero residuals. This is not FEL reconstruction or 12-bit output.
+
+    Set before opening the file. Embedding applications must opt in explicitly;
+    normal playback and applications not setting this option remain unchanged.
 
 ``--gpu-sw``
     Continue even if a software renderer is detected. This only works with

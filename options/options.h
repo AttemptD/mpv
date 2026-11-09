@@ -86,12 +86,16 @@ typedef struct mp_vo_opts {
     int video_sync;
 
     struct m_geometry android_surface_size;
+    bool android_hdr_output;
+    bool android_dovi_yuv;
+    bool android_dovi_dual;
 
     struct m_geometry d3d11_composition_size;
 
     int swapchain_depth;  // max number of images to render ahead
 
     struct m_geometry video_crop;
+    bool android_dovi_mel_fast;
 } mp_vo_opts;
 
 // Subtitle options needed by the subtitle decoders/renderers.
@@ -166,6 +170,9 @@ struct mp_bluray_opts {
     int min_title_length;
     int region;
     int uo_restriction;
+    int64_t remote_cache_size;
+    int64_t remote_prefetch_size;
+    bool remote_fast_open;
 };
 
 struct dvda_opts {

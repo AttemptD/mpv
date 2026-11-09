@@ -20,6 +20,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
+#include <string.h>
 
 #include "mpv_talloc.h"
 
@@ -163,6 +164,11 @@ static void vo_chain_uninit(struct vo_chain *vo_c)
 void uninit_video_chain(struct MPContext *mpctx)
 {
     if (mpctx->vo_chain) {
+        // Surface-backed BL/EL buffers are invalidated when their decoders
+        // are destroyed. Quiesce the VO queue on its own thread first, just
+        // as seek and decoder-mode changes do. The helper is restricted to
+        // the Android Dolby Vision path; other outputs keep their lifecycle.
+        vo_prepare_decoder_uninit(mpctx->video_out);
         reset_video_state(mpctx);
         vo_chain_uninit(mpctx->vo_chain);
         mpctx->vo_chain = NULL;
@@ -171,6 +177,21 @@ void uninit_video_chain(struct MPContext *mpctx)
 
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
     }
+}
+
+bool mp_android_p7_active(struct MPContext *mpctx)
+{
+#if HAVE_EGL_ANDROID
+    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    // Manual/performance base mode disables EL but remains opted into the
+    // experimental P7 policy. It needs the same decoder lifecycle protection.
+    return track && (mpctx->opts->vo->android_dovi_dual ||
+                     track->android_p7_managed) &&
+           track->stream && track->stream->codec &&
+           track->stream->codec->dovi && track->stream->codec->dv_profile == 7;
+#else
+    return false;
+#endif
 }
 
 int init_video_decoder(struct MPContext *mpctx, struct track *track)
@@ -193,7 +214,18 @@ int init_video_decoder(struct MPContext *mpctx, struct track *track)
     if (!track->dec)
         goto err_out;
 
-    if (sh_stream_dependent_sibling(track->stream))
+#if HAVE_EGL_ANDROID
+    bool invisible_paused = mpctx->opts->pause &&
+        mp_android_p7_active(mpctx) && mpctx->video_out &&
+        strcmp(mpctx->video_out->driver->name, "null") == 0;
+    mp_decoder_wrapper_set_suspended(track->dec, invisible_paused);
+#endif
+
+    bool pair_el = sh_stream_dependent_sibling(track->stream) != NULL;
+#if HAVE_EGL_ANDROID
+    pair_el = pair_el && mpctx->opts->vo->android_dovi_dual;
+#endif
+    if (pair_el)
         mp_decoder_wrapper_set_extra_hw_frames(track->dec, MP_ENHANCEMENT_PAIR_QUEUE_MAX);
 
     if (!mp_decoder_wrapper_reinit(track->dec))
@@ -1091,6 +1123,21 @@ void write_video(struct MPContext *mpctx)
     struct track *track = mpctx->vo_chain->track;
     struct vo_chain *vo_c = mpctx->vo_chain;
     struct vo *vo = vo_c->vo;
+
+#if HAVE_EGL_ANDROID
+    // Android removes the window with --vo=null while the app is paused.
+    // A recovery seek puts video back in STATUS_SYNCING, which normally
+    // decodes a paused preview even without a visible window. On the opted-in
+    // P7 path that unnecessarily starts a software/copy BL and EL decode.
+    // Wait for the real VO instead; its rebuild queues the exact recovery
+    // seek. Unpaused null output (including background audio) stays supported.
+    bool invisible_paused = opts->pause && mp_android_p7_active(mpctx) &&
+                            strcmp(vo->driver->name, "null") == 0;
+    if (track && track->dec)
+        mp_decoder_wrapper_set_suspended(track->dec, invisible_paused);
+    if (invisible_paused)
+        return;
+#endif
 
     if (vo_c->filter->reconfig_happened) {
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);

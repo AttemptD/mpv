@@ -1481,6 +1481,19 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     if (demuxer->opts->index_mode != 1)
         avfc->flags |= AVFMT_FLAG_IGNIDX;
 
+    // DVD MPEG program streams commonly carry DTS without a PTS on reordered
+    // video packets. Software decoders can reconstruct this internally, but
+    // Android MediaCodec receives the packet timestamp directly and otherwise
+    // turns every missing PTS into zero. The video clock then stalls while
+    // audio keeps advancing. Restrict PTS generation to the DVD packet stream;
+    // normal files, Blu-ray and network demuxers retain their original policy.
+    struct stream_dvd_info_req dvd_info;
+    if (stream_control(priv->stream, STREAM_CTRL_GET_DVD_INFO, &dvd_info) ==
+        STREAM_OK) {
+        avfc->flags |= AVFMT_FLAG_GENPTS;
+        MP_VERBOSE(demuxer, "Generating missing DVD packet PTS for decoder compatibility.\n");
+    }
+
     if (lavfdopts->probesize) {
         if (av_opt_set_int(avfc, "probesize", lavfdopts->probesize, 0) < 0)
             MP_ERR(demuxer, "couldn't set option probesize to %"PRId64"\n",

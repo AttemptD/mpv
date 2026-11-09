@@ -47,6 +47,10 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
 // Video only.
 void mp_decoder_wrapper_set_extra_hw_frames(struct mp_decoder_wrapper *d, int n);
 
+// Suspend packet feeding/output retrieval, preserving decoder state. Can be
+// changed by the player even when the optional decoder queue thread is enabled.
+void mp_decoder_wrapper_set_suspended(struct mp_decoder_wrapper *d, bool suspended);
+
 // Legacy decoder framedrop control.
 void mp_decoder_wrapper_set_frame_drops(struct mp_decoder_wrapper *d, int num);
 int mp_decoder_wrapper_get_frames_dropped(struct mp_decoder_wrapper *d);

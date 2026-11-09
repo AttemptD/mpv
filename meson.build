@@ -476,7 +476,11 @@ features += {'memrchr': cc.has_function('memrchr', args: '-D_GNU_SOURCE',
                                         prefix: '#include <string.h>')}
 features += {'pipe2': cc.has_function('pipe2', args: '-D_GNU_SOURCE',
                                       prefix: '#include <unistd.h>')}
-features += {'clone': cc.has_header_symbol('sched.h', 'clone', args: '-D_GNU_SOURCE')}
+# Android's ART signal handlers and Bionic fdsan bookkeeping must not be
+# modified by a CLONE_VM child. Use Bionic fork(), including its atfork and
+# child-only fdsan handling, instead of the shared-address-space fast path.
+features += {'clone': host_machine.system() != 'android' and
+                     cc.has_header_symbol('sched.h', 'clone', args: '-D_GNU_SOURCE')}
 features += {'rfork': cc.has_header_symbol('unistd.h', 'RFSPAWN') and
                       cc.has_function('rfork_thread', prefix: '#include <unistd.h>')}
 
@@ -681,7 +685,8 @@ dvdnav_opt = get_option('dvdnav').require(
     get_option('gpl'),
     error_message: 'the build is not GPL!',
 )
-dvdnav = dependency('dvdnav', version: '>= 6.1.0', required: dvdnav_opt)
+dvdnav = dependency('dvdnav', version: '>= 6.1.0', required: dvdnav_opt,
+                    static: true)
 features += {'dvdnav': dvdnav.found()}
 if features['dvdnav']
     dependencies += dvdnav
