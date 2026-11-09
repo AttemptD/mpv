@@ -79,7 +79,7 @@ static bool init_host(struct vo *vo)
     jclass cls = (*env)->GetObjectClass(env, p->host);
     jmethodID video = (*env)->GetMethodID(env, cls, "getVideoSurface", "()Landroid/view/Surface;");
     jmethodID captions = (*env)->GetMethodID(env, cls, "getCaptionSurface", "()Landroid/view/Surface;");
-    p->geometry = (*env)->GetMethodID(env, cls, "setGeometry", "(IIIIIIIIIII)V");
+    p->geometry = (*env)->GetMethodID(env, cls, "setGeometry", "(IIIIIIIIIIIII)V");
     p->visibility = (*env)->GetMethodID(env, cls, "setVisible", "(Z)V");
     (*env)->DeleteLocalRef(env, cls);
     if (!java_ok(vo, env) || !video || !captions || !p->geometry || !p->visibility)
@@ -160,7 +160,7 @@ static void update_geometry(struct vo *vo)
         return;
     (*env)->CallVoidMethod(env, p->host, p->geometry,
         src.x0, src.y0, src.x1, src.y1, dst.x0, dst.y0, dst.x1, dst.y1,
-        vo->params->rotate, w, h);
+        vo->params->rotate, w, h, vo->params->w, vo->params->h);
     java_ok(vo, env);
     if (ANativeWindow_setBuffersGeometry(p->captions, w, h, WINDOW_FORMAT_RGBA_8888) < 0)
         p->failed = true;
