@@ -2613,6 +2613,7 @@ static int property_imgparams(const struct mp_image_params *p, int action, void 
             SUB_PROP_STR(m_opt_choice_str(pl_csp_prim_names, p->color.primaries))},
         {"gamma",
             SUB_PROP_STR(m_opt_choice_str(pl_csp_trc_names, p->color.transfer))},
+        {"dolby-vision-mel", SUB_PROP_BOOL(p->dovi_mel)},
         {"sig-peak", SUB_PROP_FLOAT(p->color.hdr.max_luma / MP_REF_WHITE)},
         {"light",
             SUB_PROP_STR(m_opt_choice_str(mp_csp_light_names, p->light))},
@@ -3168,6 +3169,7 @@ static int mp_property_android_native_dolby(void *ctx, struct m_property *prop,
              : mpctx->opts->vo->android_native_dolby))
         vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_NATIVE_DOLBY, &state);
     struct m_sub_property props[] = {
+        {"mel-conversion", SUB_PROP_BOOL(!hdr && mpctx->opts->vo->android_native_dolby_p7_mel)},
         {"active", SUB_PROP_BOOL(state.active)},
         {"failed", SUB_PROP_BOOL(state.failed)},
         {"decoder-failed", SUB_PROP_BOOL(state.decoder_failed)},

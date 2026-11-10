@@ -7282,6 +7282,15 @@ them.
     :/opt/homebrew/bin:  homebrew (ARM) install path
     :/opt/homebrew/sbin: homebrew (ARM) install path
 
+``--android-native-dolby-p7-mel=<yes|no>``
+    Permit native Dolby output for Profile 7 MEL by converting its RPU and
+    configuration to single-layer Profile 8.1 (default: no). Requires
+    ``android-native-dolby=yes`` and the matching FFmpeg converter. The host
+    must first confirm ``video-dec-params/dolby-vision-mel``. The converter
+    independently checks every RPU and rejects FEL, malformed or unsupported
+    metadata before discarding enhancement NAL units. A failure must restore
+    GPU playback of the original stream. No video image data is re-encoded.
+
 ``--android-native-dolby=<yes|no>``
     Enable platform Dolby Vision P5/P8 decoding for the Android native Dolby VO
     (default: no). Requires a supported decoder/display and an embedding host

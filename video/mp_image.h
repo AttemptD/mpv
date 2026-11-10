@@ -66,6 +66,8 @@ struct mp_image_params {
     // Flags for f_enhancement_pair.c to not inherit flags from EL.
     bool no_dovi;
     bool no_enhancement_layer;
+    // Original decoded RPU is canonical zero-residual MEL. Not inherited from EL.
+    bool dovi_mel;
 };
 
 /* Memory management:

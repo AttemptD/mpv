@@ -913,14 +913,21 @@ static void init_avctx(struct mp_filter *vd)
         }
     }
     if (native_surface && ctx->vo->opts->android_native_dolby) {
+        bool mel = ctx->vo->opts->android_native_dolby_p7_mel;
         if (!ctx->use_hwdec || ctx->hwdec.copying ||
             strcmp(lavc_codec->name, "hevc_mediacodec") != 0 ||
-            (c->dv_profile != 5 && c->dv_profile != 8)) {
-            MP_ERR(vd, "Native Dolby Vision requires P5/P8 MediaCodec Surface decoding.\n");
+            (mel ? c->dv_profile != 7 || c->dv_bl_compatibility_id != 6
+                 : c->dv_profile != 5 && c->dv_profile != 8)) {
+            MP_ERR(vd, "Native Dolby Vision requires P5/P8 or verified P7 MEL MediaCodec decoding.\n");
             goto error;
         }
         if (av_opt_set_int(avctx, "native_dolby_vision", 1, AV_OPT_SEARCH_CHILDREN) < 0) {
             MP_ERR(vd, "FFmpeg does not support native Dolby Vision Surface decoding.\n");
+            goto error;
+        }
+        if (mel && av_opt_set_int(avctx, "native_dolby_p7_mel", 1,
+                                  AV_OPT_SEARCH_CHILDREN) < 0) {
+            MP_ERR(vd, "FFmpeg does not support strict P7 MEL conversion.\n");
             goto error;
         }
     }

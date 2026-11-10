@@ -38,6 +38,7 @@
 #include "fmt-conversion.h"
 #include "hwdec.h"
 #include "mp_image.h"
+#include "video/dovi_mel.h"
 #include "osdep/threads.h"
 #include "sws_utils.h"
 #include "out/placebo/utils.h"
@@ -570,6 +571,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.sys_orig = src->params.sys_orig;
     dst->params.no_dovi = src->params.no_dovi;
     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+    dst->params.dovi_mel = src->params.dovi_mel;
 
     // ensure colorspace consistency
     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);
@@ -1210,6 +1212,7 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     if (sd) {
 #ifdef PL_HAVE_LAV_DOLBY_VISION
         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
+        dst->params.dovi_mel = mp_dovi_is_mel(metadata);
         dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
         MP_HANDLE_OOM(dovi);
         pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,

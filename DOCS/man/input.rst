@@ -4043,6 +4043,15 @@ Property list
     and ``osd-updates`` count submitted video buffers and caption updates for
     this VO instance. In other VOs, flags are false and counters are zero.
 
+    ``mel-conversion`` reports whether P7 MEL to P8.1 conversion was requested.
+
+``video-dec-params/dolby-vision-mel``
+    True only if the original decoded frame carries a canonical zero-residual
+    MEL RPU. Metadata inherited from a separate enhancement stream is not
+    sufficient for native conversion of the selected base stream. Hosts must
+    also check that the selected source is Profile 7 and the device supports
+    Profile 8. A false value includes absent or unrecognized RPU metadata.
+
 ``android-native-hdr-status``
     Same counters and failure flags as ``android-native-dolby-status``, scoped
     to native HDR presentation. ``transfer`` is the requested ``pq`` or ``hlg``
