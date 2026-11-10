@@ -1486,6 +1486,16 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
 
     int ret = decode_frame(vd);
 
+    if (ctx->hwdec_failed && native_surface_requested(ctx)) {
+        // Native presentation cannot consume the software/copy-back frames
+        // selected by the generic fallback loop. Report runtime failures just
+        // like initialization failures and let the host reload with a GPU VO.
+        MP_ERR(vd, "Native Surface decoding failed; host GPU recovery required.\n");
+        vo_control(ctx->vo, VOCTRL_ANDROID_NATIVE_DOLBY_DECODER_FAILED, NULL);
+        uninit_avctx(vd);
+        return AVERROR_EOF;
+    }
+
     if (ctx->hwdec_failed) {
         // Failed hardware decoding? Try the next one, and eventually software.
         struct demux_packet **pkts = ctx->sent_packets;
