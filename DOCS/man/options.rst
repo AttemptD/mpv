@@ -5939,6 +5939,22 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     network thread from the consumer (default: 4 MiB, minimum: 32 KiB).
     Lower values may reduce in-flight data and reduce latency.
 
+``--curl-seek-cache-size=<bytes>``
+    Maximum raw-byte cache per seekable HTTP stream with a known size
+    (default: 32 MiB, range: 0-256 MiB). Memory is allocated as data is read.
+    Reuses consumed data and unread prefetch when a demuxer alternates between
+    distant audio, video and subtitle ranges. This is separate from the
+    demuxer packet cache. Set to 0 to disable it.
+
+    Nearby forward seeks also read through gaps of up to ``--curl-buffer-size``
+    bytes on the existing connection, retaining the skipped bytes in this cache.
+
+    On a distant cache miss, collects up to 4 MiB of prefetch, bounded by the
+    curl ring buffer and this cache size. The collection deadline is one
+    second after starting the request; normal first-byte waiting still applies.
+    Ignored for non-seekable, unknown-size and non-HTTP streams, and for disc
+    image readers which already maintain their own raw-byte cache.
+
 ``--curl-max-request-size=<bytes>``
     For seekable streams, split the transfer into Range requests of at most
     this size (default: 0, i.e. one open-ended request for the whole stream).

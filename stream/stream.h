@@ -54,6 +54,7 @@
 #define STREAM_LOCAL_FS_ONLY      (1 << 5) // stream_file only, no URLs
 #define STREAM_LESS_NOISE         (1 << 6) // try to log errors only
 #define STREAM_ALLOW_PARTIAL_READ (1 << 7) // allows partial read with stream_read_file()
+#define STREAM_NO_SEEK_CACHE      (1 << 8) // the caller already caches raw byte ranges
 
 // Default flags used by stream_read_file().
 #define STREAM_READ_FILE_FLAGS_DEFAULT \

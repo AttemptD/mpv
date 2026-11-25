@@ -32,6 +32,7 @@
 
 #include "stream.h"
 #include "stream_curl.h"
+#include "curl_seek_cache.h"
 
 #include "common/common.h"
 #include "common/global.h"
@@ -83,6 +84,7 @@ struct curl_opts {
     int max_retries;
     double connect_timeout;
     int64_t buffer_size;
+    int64_t seek_cache_size;
     int64_t max_request_size;
 };
 
@@ -115,6 +117,8 @@ const struct m_sub_options curl_conf = {
         {"connect-timeout", OPT_DOUBLE(connect_timeout), M_RANGE(0, 600)},
         {"buffer-size", OPT_BYTE_SIZE(buffer_size),
             M_RANGE(2 * CURL_MAX_WRITE_SIZE, M_MAX_MEM_BYTES)},
+        {"seek-cache-size", OPT_BYTE_SIZE(seek_cache_size),
+            M_RANGE(0, 256 * 1024 * 1024)},
         {"max-request-size", OPT_BYTE_SIZE(max_request_size),
             M_RANGE(0, M_MAX_MEM_BYTES)},
         {0}
@@ -128,6 +132,7 @@ const struct m_sub_options curl_conf = {
         .max_retries = 5,
         .connect_timeout = 30,
         .buffer_size = 4 << 20, // 4 MiB
+        .seek_cache_size = 32 << 20, // allocated lazily, separate from demux cache
         .max_request_size = 0,
     },
     .size = sizeof(struct curl_opts),
@@ -195,12 +200,38 @@ struct priv {
     uint8_t *buffer;
     size_t buffer_size;
     size_t head, tail, count;
+    // Logical reader and the beginning of the producer's unread ring. Cached
+    // seeks can move the reader without canceling the current HTTP transfer.
+    uint64_t read_pos, network_pos;
+    size_t seek_prefetch;
+    int64_t seek_prefetch_until;
+    struct mp_curl_cache seek_cache;
+    uint64_t seek_cache_hits, seek_cache_misses;
     bool paused;         // write callback paused due to a full buffer
     bool stream_eof;     // producer has delivered all data
     bool stream_error;   // unrecoverable error
     atomic_bool aborted; // canceled by user (mp_cancel)
     struct mp_icy *icy;  // ICY metadata state, dormant until Icy-MetaInt seen
 };
+
+static bool seek_cache_enabled(struct priv *p)
+{
+    return p->seek_cache.count && p->seekable && p->content_size >= 0 &&
+           p->scheme->proto == MP_CURL_PROTO_HTTP;
+}
+
+// Save unread prefetch before replacing a transfer. Previously a track switch
+// discarded up to curl-buffer-size bytes, only to fetch them again on return.
+// Caller holds p->mtx; only validated, byte-addressable body data is retained.
+static void cache_unread(struct priv *p)
+{
+    if (!seek_cache_enabled(p) || !p->count)
+        return;
+    size_t first = MPMIN(p->count, p->buffer_size - p->head);
+    mp_curl_cache_put(&p->seek_cache, p->network_pos, p->buffer + p->head, first);
+    mp_curl_cache_put(&p->seek_cache, p->network_pos + first,
+                      p->buffer, p->count - first);
+}
 
 // Curl thread
 
@@ -255,8 +286,25 @@ static void run_cmd(void *arg)
             c->p->active = false;
         }
         mp_mutex_lock(&c->p->mtx);
-        if (c->drop)
+        if (c->drop) {
+            cache_unread(c->p);
+            uint64_t distance = c->pos > c->p->network_pos
+                              ? c->pos - c->p->network_pos
+                              : c->p->network_pos - c->pos;
+            // A distant track switch can cancel a new transfer as soon as its
+            // first tiny packet arrives. Amortize that request by retaining a
+            // window first. Stay below capacity so curl's full-buffer pause
+            // can never leave the reader waiting for an impossible size.
+            c->p->seek_prefetch = seek_cache_enabled(c->p) &&
+                                  distance > c->p->buffer_size
+                ? MPMIN(c->p->buffer_size - CURL_MAX_WRITE_SIZE,
+                        MPMIN(4 << 20, c->p->seek_cache.count * c->p->seek_cache.block_size))
+                : 0;
+            c->p->seek_prefetch_until = c->p->seek_prefetch
+                                    ? mp_time_ns() + MP_TIME_MS_TO_NS(1000) : 0;
             c->p->head = c->p->tail = c->p->count = 0;
+            c->p->network_pos = c->pos;
+        }
         c->p->paused = false;
         c->p->stream_eof = false;
         c->p->stream_error = false;
@@ -1042,19 +1090,98 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 
     mp_mutex_lock(&p->mtx);
 
-    while (p->count == 0 && !p->stream_eof && !p->stream_error &&
+    while (seek_cache_enabled(p) && p->read_pos != p->network_pos &&
            !atomic_load_explicit(&p->aborted, memory_order_relaxed))
     {
-        mp_cond_wait(&p->cond, &p->mtx);
+        if (p->read_pos > p->network_pos &&
+            p->read_pos - p->network_pos <= p->count)
+        {
+            size_t skip = p->read_pos - p->network_pos;
+            // Keep skipped prefetch available for a later backward seek.
+            cache_unread(p);
+            p->head = (p->head + skip) % p->buffer_size;
+            p->count -= skip;
+            p->network_pos = p->read_pos;
+            // A forward skip can empty a paused ring. Resume before waiting
+            // for more bytes, otherwise both producer and reader would wait.
+            if (p->paused && !p->stream_eof && !p->stream_error &&
+                p->buffer_size - p->count >= p->buffer_size / 2)
+            {
+                mp_mutex_unlock(&p->mtx);
+                cmd_async(p, CMD_UNPAUSE);
+                mp_mutex_lock(&p->mtx);
+            }
+            break;
+        }
+        size_t cached = mp_curl_cache_get(&p->seek_cache, p->read_pos,
+                                          buffer, max_len);
+        if (cached) {
+            p->read_pos += cached;
+            p->seek_cache_hits++;
+            mp_mutex_unlock(&p->mtx);
+            return cached;
+        }
+        // A nearby forward packet may not have arrived yet. Keep the existing
+        // connection and read through the small gap instead of canceling it
+        // after every audio chunk. Unread data is retained before advancing.
+        if (p->read_pos > p->network_pos &&
+            p->read_pos - p->network_pos <= p->buffer_size &&
+            !p->stream_eof && !p->stream_error)
+        {
+            if (!p->count) {
+                mp_cond_wait(&p->cond, &p->mtx);
+                continue;
+            }
+            cache_unread(p);
+            p->network_pos += p->count;
+            p->head = p->tail;
+            p->count = 0;
+            if (p->paused) {
+                mp_mutex_unlock(&p->mtx);
+                cmd_async(p, CMD_UNPAUSE);
+                mp_mutex_lock(&p->mtx);
+            }
+            continue;
+        }
+        // Only a miss changes the underlying transfer. Disjoint audio/video
+        // regions can therefore advance independently through a small cache.
+        uint64_t pos = p->read_pos;
+        p->seek_cache_misses++;
+        mp_mutex_unlock(&p->mtx);
+        cmd_sync(p, CMD_SEEK, pos, true);
+        mp_mutex_lock(&p->mtx);
+    }
+
+    // Cancellation can interrupt a read-through gap before reaching the
+    // logical position. Never return bytes from the abandoned physical cursor.
+    if (p->read_pos != p->network_pos) {
+        mp_mutex_unlock(&p->mtx);
+        return 0;
+    }
+
+    size_t need = p->seek_prefetch ? p->seek_prefetch : 1;
+    while ((p->count == 0 || (p->count < need && mp_time_ns() < p->seek_prefetch_until)) &&
+           !p->stream_eof && !p->stream_error &&
+           !atomic_load_explicit(&p->aborted, memory_order_relaxed))
+    {
+        if (p->count && p->seek_prefetch)
+            mp_cond_timedwait_until(&p->cond, &p->mtx, p->seek_prefetch_until);
+        else
+            mp_cond_wait(&p->cond, &p->mtx);
     }
 
     size_t copy = MPMIN((size_t)max_len, p->count);
+    p->seek_prefetch = 0;
     if (copy > 0) {
         size_t head_chunk = MPMIN(p->buffer_size - p->head, copy);
         memcpy(buffer, p->buffer + p->head, head_chunk);
         memcpy((char *)buffer + head_chunk, p->buffer, copy - head_chunk);
+        if (seek_cache_enabled(p))
+            mp_curl_cache_put(&p->seek_cache, p->network_pos, buffer, copy);
         p->head = (p->head + copy) % p->buffer_size;
         p->count -= copy;
+        p->network_pos += copy;
+        p->read_pos += copy;
     }
 
     bool unpause = p->paused && !p->stream_eof && !p->stream_error &&
@@ -1073,6 +1200,17 @@ static int curl_seek(struct stream *s, int64_t pos)
     struct priv *p = s->priv;
     if (pos < 0)
         return 0;
+    mp_mutex_lock(&p->mtx);
+    p->read_pos = pos;
+    bool cached = seek_cache_enabled(p) &&
+        (mp_curl_cache_has(&p->seek_cache, pos) ||
+         ((uint64_t)pos >= p->network_pos &&
+          ((uint64_t)pos - p->network_pos <= p->count ||
+           ((uint64_t)pos - p->network_pos <= p->buffer_size &&
+            !p->stream_eof && !p->stream_error))));
+    mp_mutex_unlock(&p->mtx);
+    if (cached)
+        return 1;
     cmd_sync(p, CMD_SEEK, pos, true);
     return 1;
 }
@@ -1114,6 +1252,7 @@ static void priv_destructor(void *ptr)
     }
     if (p->headers)
         curl_slist_free_all(p->headers);
+    mp_curl_cache_uninit(&p->seek_cache);
     mp_mutex_destroy(&p->mtx);
     mp_cond_destroy(&p->cond);
 }
@@ -1175,6 +1314,10 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         if (oa->end_offset > 0)
             p->request_end = oa->end_offset;
     }
+
+    p->read_pos = p->network_pos = p->start_offset;
+    mp_curl_cache_init(&p->seek_cache,
+        args->flags & STREAM_NO_SEEK_CACHE ? 0 : p->opts->seek_cache_size);
 
     mp_mutex_init(&p->mtx);
     mp_cond_init(&p->cond);

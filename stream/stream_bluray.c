@@ -1735,7 +1735,8 @@ static int bluray_stream_open_internal(stream_t *s)
     bool remote = is_remote_url(device_tmp);
     int opened;
     if (remote) {
-        b->iso_stream = stream_create(device_tmp, STREAM_READ | s->stream_origin,
+        int cache_flag = b->opts->remote_cache_size > 0 ? STREAM_NO_SEEK_CACHE : 0;
+        b->iso_stream = stream_create(device_tmp, STREAM_READ | s->stream_origin | cache_flag,
                                       s->cancel, s->global);
         talloc_free(device_tmp);
         if (!b->iso_stream) {
