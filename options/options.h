@@ -89,6 +89,7 @@ typedef struct mp_vo_opts {
     bool android_hdr_output;
     bool android_native_dolby;
     int android_native_hdr;
+    bool android_native_hdr_p7_base;
     int64_t android_native_dolby_surface;
     bool android_dovi_yuv;
     bool android_dovi_dual;

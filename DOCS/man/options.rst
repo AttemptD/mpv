@@ -7306,6 +7306,14 @@ them.
     Do not enable together with ``android-native-dolby``. Applications must
     verify the matching display/decoder capability and implement GPU fallback.
 
+``--android-native-hdr-p7-base=<yes|no>``
+    Allow ``android-native-hdr=pq`` to present only the original HDR10 base
+    layer of Dolby Vision Profile 7 with compatibility ID 6 (default: no).
+    Requires the matching FFmpeg ``native_hdr_p7_base`` extension. Removes
+    RPU and enhancement-layer NAL units without re-encoding the base image.
+    This discards MEL/FEL and dynamic Dolby metadata; it is HDR10 fallback,
+    not complete Dolby Vision playback. Never applies to Profile 5.
+
 ``--android-native-dolby-surface=<reference>``
     JNI-only reference to the embedding application's ``NativeDolbySurface``
     object. Like ``wid``, the reference is owned by the embedding application.

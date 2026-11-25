@@ -3175,6 +3175,7 @@ static int mp_property_android_native_dolby(void *ctx, struct m_property *prop,
         {"decoder-failed", SUB_PROP_BOOL(state.decoder_failed)},
         {"frames", SUB_PROP_INT64(state.frames)},
         {"osd-updates", SUB_PROP_INT64(state.osd_updates)},
+        {"base-layer-only", SUB_PROP_BOOL(hdr && mpctx->opts->vo->android_native_hdr_p7_base)},
         {"transfer", SUB_PROP_STR(hdr ? (mpctx->opts->vo->android_native_hdr == 18 ? "hlg" :
                                            mpctx->opts->vo->android_native_hdr == 16 ? "pq" : "no") : "dolby")},
         {0}

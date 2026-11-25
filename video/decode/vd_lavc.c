@@ -892,7 +892,10 @@ static void init_avctx(struct mp_filter *vd)
 #if HAVE_ANDROID
     if (native_surface && ctx->vo->opts->android_native_hdr) {
         int transfer = ctx->vo->opts->android_native_hdr;
-        bool compatible = !c->dovi || (c->dv_profile == 8 && !c->dv_el_present &&
+        bool p7_base = ctx->vo->opts->android_native_hdr_p7_base &&
+            c->dovi && c->dv_profile == 7 &&
+            c->dv_bl_compatibility_id == 6 && transfer == 16;
+        bool compatible = !c->dovi || p7_base || (c->dv_profile == 8 && !c->dv_el_present &&
             c->dv_bl_compatibility_id == (transfer == 16 ? 1 : 4));
         bool codec_ok = !strcmp(lavc_codec->name, "hevc_mediacodec") ||
                         !strcmp(lavc_codec->name, "vp9_mediacodec") ||
@@ -900,6 +903,11 @@ static void init_avctx(struct mp_filter *vd)
         if (!ctx->use_hwdec || ctx->hwdec.copying || !codec_ok || !compatible ||
             av_opt_set_int(avctx, "native_hdr_output", transfer, AV_OPT_SEARCH_CHILDREN) < 0) {
             MP_ERR(vd, "Native HDR requires compatible PQ/HLG MediaCodec Surface decoding.\n");
+            goto error;
+        }
+        if (p7_base && av_opt_set_int(avctx, "native_hdr_p7_base", 1,
+                                    AV_OPT_SEARCH_CHILDREN) < 0) {
+            MP_ERR(vd, "This FFmpeg build cannot extract the P7 HDR10 base layer.\n");
             goto error;
         }
         // A prior native Dolby decoder can report its processed PQ output in
