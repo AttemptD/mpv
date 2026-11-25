@@ -95,6 +95,7 @@ struct image {
     int w, h; // logical size (after transformation)
     struct gl_transform transform; // rendering transformation
     int padding; // number of leading padding components (e.g. 2 = rg is padding)
+    struct mp_rect sample_crop; // bounds in plane texels, or empty for no clamp
 };
 
 // A named image, for user scripting purposes
@@ -911,6 +912,11 @@ static void pass_get_images(struct gl_video *p, struct video_image *vimg,
 
         get_transform(t->w, t->h, p->image_params.rotate, t->flipped,
                       &img[n].transform);
+        if (n == 0 && vimg->hwdec_mapped) {
+            img[n].sample_crop = p->hwdec_mapper->sample_crop;
+            img[n].transform.t[0] += img[n].sample_crop.x0;
+            img[n].transform.t[1] += img[n].sample_crop.y0;
+        }
         if (p->image_params.rotate % 180 == 90)
             MPSWAP(int, img[n].w, img[n].h);
 
@@ -1233,6 +1239,32 @@ static void pass_prepare_src_tex(struct gl_video *p)
         gl_sc_uniform_vec2(sc, texture_off, (float *)s->transform.t);
         gl_sc_uniform_vec2(sc, pixel_size, (float[]){1.0f / f[0],
                                                      1.0f / f[1]});
+        struct mp_rect crop = s->sample_crop;
+        if (mp_rect_w(crop) > 0) {
+            // External YUV textures can filter chroma beyond the luma bounds.
+            // Reconstruct bilinear samples from exact texels at the edges.
+            char *lo = mp_tprintf(32, "texture_min%d", n);
+            char *hi = mp_tprintf(32, "texture_max%d", n);
+            gl_sc_uniform_vec2(sc, lo, (float[]){crop.x0, crop.y0});
+            gl_sc_uniform_vec2(sc, hi, (float[]){crop.x1 - 1, crop.y1 - 1});
+            PRELUDE("vec4 sample_texture%d(vec2 pos) {\n"
+                    "    vec2 lower = %s, upper = %s;\n"
+                    "    vec2 px = clamp(pos * texture_size%d - 0.5, lower, upper);\n"
+                    "    if (all(greaterThanEqual(px, lower + 1.0)) &&\n"
+                    "        all(lessThanEqual(px, upper - 1.0)))\n"
+                    "        return texture(texture%d, pos);\n"
+                    "    ivec2 a = ivec2(floor(px));\n"
+                    "    ivec2 b = min(a + ivec2(1), ivec2(upper));\n"
+                    "    vec2 f = fract(px);\n"
+                    "    vec4 top = mix(texelFetch(texture%d, a, 0),\n"
+                    "                   texelFetch(texture%d, ivec2(b.x, a.y), 0), f.x);\n"
+                    "    vec4 bottom = mix(texelFetch(texture%d, ivec2(a.x, b.y), 0),\n"
+                    "                      texelFetch(texture%d, b, 0), f.x);\n"
+                    "    return mix(top, bottom, f.y);\n"
+                    "}\n", n, lo, hi, n, n, n, n, n, n);
+        } else {
+            PRELUDE("#define sample_texture%d(pos) texture(texture%d, (pos))\n", n, n);
+        }
     }
 }
 
@@ -1442,7 +1474,7 @@ static void copy_image(struct gl_video *p, unsigned int *offset, struct image im
         img.multiplier *= 1.0 / (tex_max - 1);
     }
 
-    GLSLF("color.%s = %f * vec4(texture(texture%d, texcoord%d)).%s;\n",
+    GLSLF("color.%s = %f * vec4(sample_texture%d(texcoord%d)).%s;\n",
           dst, img.multiplier, id, id, src);
 
     *offset += count;
@@ -1488,8 +1520,8 @@ static void hook_prelude(struct gl_video *p, const char *name, int id,
     }
 
     // Set up the sampling functions
-    GLSLHF("#define %s_tex(pos) (%s_mul * vec4(texture(%s_raw, pos)).%s)\n",
-           name, name, name, crap);
+    GLSLHF("#define %s_tex(pos) (%s_mul * vec4(sample_texture%d(pos)).%s)\n",
+           name, name, id, crap);
 
     if (p->ra->caps & RA_CAP_GATHER) {
         GLSLHF("#define %s_gather(pos, c) (%s_mul * vec4("
@@ -3869,6 +3901,9 @@ static bool pass_upload_image(struct gl_video *p, struct mp_image *mpi, uint64_t
         if (!p->hwdec_mapper)
             goto error;
 
+        // Custom shaders can sample the raw texture directly, so their
+        // texture still needs to be bounded by the mapper.
+        p->hwdec_mapper->can_clamp_crop = !p->opts.user_shaders || !p->opts.user_shaders[0];
         pass_describe(p, "map frame (hwdec)");
         timer_pool_start(p->upload_timer);
         bool ok = ra_hwdec_mapper_map(p->hwdec_mapper, vimg->mpi) >= 0;
@@ -3882,10 +3917,11 @@ static bool pass_upload_image(struct gl_video *p, struct mp_image *mpi, uint64_t
 
         if (ok) {
             struct ra_tex **tex = p->hwdec_mapper->tex;
+            struct mp_rect crop = p->hwdec_mapper->sample_crop;
             for (int n = 0; n < p->plane_count; n++) {
                 vimg->planes[n] = (struct texplane){
-                    .w = tex[n]->params.w,
-                    .h = tex[n]->params.h,
+                    .w = n == 0 && mp_rect_w(crop) > 0 ? mp_rect_w(crop) : tex[n]->params.w,
+                    .h = n == 0 && mp_rect_h(crop) > 0 ? mp_rect_h(crop) : tex[n]->params.h,
                     .tex = tex[n],
                     .flipped = p->image_params.vflip,
                 };

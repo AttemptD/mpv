@@ -17,6 +17,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "video/out/gpu/shader_cache.h"
+
 #include <assert.h>
 #include <dlfcn.h>
 #include <EGL/egl.h>
@@ -56,6 +58,7 @@ struct priv_owner {
     media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);
     void (*AImageReader_delete)(AImageReader *);
     media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
+    media_status_t (*AImage_getCropRect)(const AImage *, AImageCropRect *);
     void (*AImage_delete)(AImage *);
     void (*AImage_deleteAsync)(AImage *, int);
     void (*AHardwareBuffer_describe)(const AHardwareBuffer *, AHardwareBuffer_Desc *);
@@ -79,6 +82,13 @@ struct priv {
     bool native_yuv420;
     bool yuv_logged;
     bool image_gpu_used;
+    bool crop_sdr;
+    bool crop_unavailable;
+    bool logged_crop_sampling;
+    bool logged_visible_copy;
+    struct ra_tex *oes_tex;
+    struct ra_tex *visible_tex;
+    struct gl_shader_cache *visible_shader;
     bool release_sync_logged;
     struct mp_image *cached_source;
     GLuint yuv_program, yuv_fbo, yuv_vao;
@@ -146,6 +156,7 @@ static bool load_lib_functions(struct priv_owner *p, struct mp_log *log)
     }
     // Optional: older/vendor runtimes can keep working using a completed GL
     // copy before release. Do not change ordinary MediaCodec device selection.
+    p->AImage_getCropRect = (void *)dlsym(p->lib_handle, "AImage_getCropRect");
     p->AImage_deleteAsync = (void *)dlsym(p->lib_handle, "AImage_deleteAsync");
     if (!p->AImage_deleteAsync)
         p->AImage_deleteAsync = (void *)dlsym(RTLD_DEFAULT, "AImage_deleteAsync");
@@ -566,6 +577,9 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     GL *gl = ra_gl_get(mapper->ra);
 
     p->log = mapper->log;
+    p->crop_sdr = gl->es >= 300 &&
+                  mapper->src_params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION &&
+                  !pl_color_transfer_is_hdr(mapper->src_params.color.transfer);
     mp_mutex_init(&p->lock);
     mp_cond_init(&p->cond);
 
@@ -629,11 +643,92 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     if (params.format->ctype != RA_CTYPE_UNORM)
         return -1;
 
-    mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
+    p->oes_tex = ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
+    mapper->tex[0] = p->oes_tex;
     if (!mapper->tex[0])
         return -1;
 
     return 0;
+}
+
+// Filtering must clamp at the decoded picture edge, not the larger
+// allocator's padded edge. Sample source texel centers into a texture
+// whose bounds match the visible rectangle, then use the normal scaler.
+static bool copy_visible_sdr(struct ra_hwdec_mapper *mapper, AImageCropRect crop)
+{
+    struct priv *p = mapper->priv;
+    GL *gl = ra_gl_get(mapper->ra);
+    int w = crop.right - crop.left;
+    int h = crop.bottom - crop.top;
+    const struct ra_format *format = NULL;
+    int depth = mapper->src_params.repr.bits.color_depth;
+    if (depth > 0 && depth <= 10)
+        format = ra_find_named_format(mapper->ra, "rgb10_a2");
+    if (!format || !format->renderable || !format->linear_filter)
+        format = ra_find_float16_format(mapper->ra, 4);
+    if (!format || !format->renderable || !format->linear_filter)
+        return false;
+    if (p->visible_tex &&
+        (p->visible_tex->params.w != w || p->visible_tex->params.h != h))
+    {
+        ra_tex_free(mapper->ra, &p->visible_tex);
+    }
+    if (!p->visible_tex) {
+        p->visible_tex = ra_tex_create(mapper->ra, &(struct ra_tex_params) {
+            .dimensions = 2, .w = w, .h = h, .d = 1, .format = format,
+            .render_src = true, .render_dst = true, .src_linear = true,
+        });
+    }
+    if (!p->visible_tex)
+        return false;
+    if (!p->visible_shader) {
+        p->visible_shader = gl_sc_create(mapper->ra, mapper->owner->global, mapper->log);
+        if (gl_check_extension(eglQueryString(eglGetCurrentDisplay(), EGL_EXTENSIONS),
+                               "EGL_ANDROID_native_fence_sync"))
+        {
+            p->CreateSyncKHR = (void *)eglGetProcAddress("eglCreateSyncKHR");
+            p->DestroySyncKHR = (void *)eglGetProcAddress("eglDestroySyncKHR");
+            p->DupNativeFenceFDANDROID = (void *)eglGetProcAddress("eglDupNativeFenceFDANDROID");
+        }
+    }
+
+    GLint old_external;
+    gl->GetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &old_external);
+    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_external);
+
+    struct gl_shader_cache *sc = p->visible_shader;
+    for (const char *const *ext = mapper->owner->glsl_extensions; ext && *ext; ext++)
+        gl_sc_enable_extension(sc, (char *)*ext);
+    gl_sc_uniform_texture(sc, "input_surface", p->oes_tex);
+    gl_sc_uniform_vec2(sc, "crop_origin", (float[]){crop.left, crop.top});
+    gl_sc_uniform_vec2(sc, "buffer_size", (float[]){p->oes_tex->params.w, p->oes_tex->params.h});
+    gl_sc_add(sc, "vec2 uv = (gl_FragCoord.xy + crop_origin) / buffer_size;\n"
+                  "color = vec4(texture(input_surface, uv).rgb, 1.0);\n");
+    static const struct ra_renderpass_input position = {
+        .name = "position", .type = RA_VARTYPE_FLOAT, .dim_v = 2, .dim_m = 1,
+    };
+    float vertices[][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+    p->image_gpu_used = true;
+    gl_sc_dispatch_draw(sc, p->visible_tex, true, &position, 1,
+                        sizeof(vertices[0]), vertices, MP_ARRAY_SIZE(vertices));
+
+    gl->GetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &old_external);
+    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_external);
+
+    if (gl_sc_error_state(sc))
+        return false;
+    mapper->tex[0] = p->visible_tex;
+    if (!p->logged_visible_copy) {
+        MP_VERBOSE(mapper, "Visible rectangle GPU copy active: %dx%d\n", w, h);
+        p->logged_visible_copy = true;
+    }
+    return true;
 }
 
 static void release_image(struct ra_hwdec_mapper *mapper)
@@ -644,9 +739,7 @@ static void release_image(struct ra_hwdec_mapper *mapper)
 
     // DrawArrays only submits the OES -> private-plane copy. AImage_delete
     // without a release fence lets the decoder overwrite that input while
-    // the GPU still reads it, producing spatially torn/shifted blocks. This
-    // synchronization is limited to the explicit Dolby YUV bridge; ordinary
-    // retained-OES playback is unchanged.
+    // the GPU still reads it, producing spatially torn/shifted blocks.
     if (p->image && p->image_gpu_used) {
         GL *gl = ra_gl_get(mapper->ra);
         if (o->AImage_deleteAsync && p->CreateSyncKHR && p->DestroySyncKHR &&
@@ -666,8 +759,13 @@ static void release_image(struct ra_hwdec_mapper *mapper)
         if (release_fd == EGL_NO_NATIVE_FENCE_FD_ANDROID)
             gl->Finish(); // Safe fallback, never release an unfinished copy.
         if (!p->release_sync_logged) {
-            MP_INFO(mapper, "Dolby YUV buffer release synchronized using %s.\n",
-                release_fd >= 0 ? "native GPU fence" : "completed GPU copy");
+            if (p->crop_sdr && p->oes_tex) {
+                MP_VERBOSE(mapper, "Android copied image release synchronized using %s.\n",
+                    release_fd >= 0 ? "native GPU fence" : "completed GPU copy");
+            } else {
+                MP_INFO(mapper, "Dolby YUV buffer release synchronized using %s.\n",
+                    release_fd >= 0 ? "native GPU fence" : "completed GPU copy");
+            }
             p->release_sync_logged = true;
         }
     }
@@ -701,6 +799,13 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
     gl->DeleteTextures(1, &p->gl_texture);
     p->gl_texture = 0;
 
+    if (p->oes_tex) {
+        mapper->tex[0] = NULL;
+        ra_tex_free(mapper->ra, &p->oes_tex);
+    }
+    ra_tex_free(mapper->ra, &p->visible_tex);
+    if (p->visible_shader)
+        gl_sc_destroy(p->visible_shader);
     for (int i = 0; i < 3; i++)
         ra_tex_free(mapper->ra, &mapper->tex[i]);
     if (p->yuv_program)
@@ -816,6 +921,10 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     }
     mp_assert(next_image);
 
+    mapper->sample_crop = (struct mp_rect){0};
+    if (p->oes_tex)
+        mapper->tex[0] = p->oes_tex;
+
     AHardwareBuffer *hwbuf = NULL;
     ret = o->AImage_getHardwareBuffer(next_image, &hwbuf);
     if (ret != AMEDIA_OK) {
@@ -863,6 +972,34 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         if (!map_yuv_bridge(mapper, d.width, d.height))
             return -1;
         MP_TRACE(mapper, "YUV copy submitted pts=%f\n", mapper->src->pts);
+    }
+
+    if (p->crop_sdr && p->oes_tex && o->AImage_getCropRect &&
+        (mapper->can_clamp_crop || !p->crop_unavailable) &&
+        (d.width > mapper->src->w || d.height > mapper->src->h))
+    {
+        AImageCropRect crop;
+        if (o->AImage_getCropRect(next_image, &crop) == AMEDIA_OK &&
+            crop.left >= 0 && crop.top >= 0 &&
+            crop.right > crop.left && crop.bottom > crop.top &&
+            (uint32_t)crop.right <= d.width && (uint32_t)crop.bottom <= d.height &&
+            crop.right - crop.left == mapper->src->w &&
+            crop.bottom - crop.top == mapper->src->h)
+        {
+            if (mapper->can_clamp_crop && mapper->tex[0] == p->oes_tex) {
+                mapper->sample_crop = (struct mp_rect){
+                    crop.left, crop.top, crop.right, crop.bottom,
+                };
+                if (!p->logged_crop_sampling) {
+                    MP_VERBOSE(mapper, "Clamping HW+ sampling to visible rectangle: %dx%d\n",
+                               mapper->src->w, mapper->src->h);
+                    p->logged_crop_sampling = true;
+                }
+            } else if (!p->crop_unavailable && !copy_visible_sdr(mapper, crop)) {
+                MP_WARN(mapper, "Could not crop padded HW+ texture.\n");
+                p->crop_unavailable = true;
+            }
+        }
     }
 
     talloc_free(p->cached_source);

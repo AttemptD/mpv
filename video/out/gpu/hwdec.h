@@ -66,6 +66,12 @@ struct ra_hwdec_mapper {
     // the mapped textures contain a full copy.
     struct mp_image *src;
 
+    // The legacy GPU renderer can clamp samples from a padded RGB texture.
+    // The mapper can return a visible rect in plane 0 texels. An empty
+    // rectangle lets the renderer sample the entire texture.
+    bool can_clamp_crop;
+    struct mp_rect sample_crop;
+
     // The mapped textures and metadata about them. These fields change if a
     // new frame is mapped (or unmapped), but otherwise remain constant.
     // The common code won't mess with these, so you can e.g. set them in the
