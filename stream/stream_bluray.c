@@ -821,6 +821,21 @@ static void dvd_proxy_close(stream_t *s, void *opaque)
 {
     bluray_priv_close(s, opaque);
 }
+
+static int dvd_proxy_open(stream_t *s, struct bluray_priv_s *b)
+{
+    bd_close(b->bd);
+    b->bd = NULL;
+    b->iso_proxy_position = 0;
+    const struct mp_dvdnav_stream_cb callbacks = {
+        .seek = dvd_proxy_seek,
+        .read = dvd_proxy_read,
+        .close = dvd_proxy_close,
+    };
+    int title = b->cfg_title >= BLURAY_DEFAULT_TITLE
+              ? b->cfg_title : BLURAY_DEFAULT_TITLE;
+    return mp_dvdnav_open_external(s, b, &callbacks, title);
+}
 #endif
 
 static const char *bd_event_str(uint32_t event)
@@ -1745,18 +1760,8 @@ static int bluray_stream_open_internal(stream_t *s)
         if (!opened) {
             MP_VERBOSE(s, "Remote image is not Blu-ray; probing DVD-Video: %s\n",
                        device);
-            bd_close(bd);
-            b->bd = NULL;
 #if HAVE_DVDNAV
-            b->iso_proxy_position = 0;
-            const struct mp_dvdnav_stream_cb callbacks = {
-                .seek = dvd_proxy_seek,
-                .read = dvd_proxy_read,
-                .close = dvd_proxy_close,
-            };
-            int title = b->cfg_title >= BLURAY_DEFAULT_TITLE
-                      ? b->cfg_title : BLURAY_DEFAULT_TITLE;
-            return mp_dvdnav_open_external(s, b, &callbacks, title);
+            return dvd_proxy_open(s, b);
 #else
             ret = STREAM_UNSUPPORTED;
             goto err;
@@ -1768,6 +1773,22 @@ static int bluray_stream_open_internal(stream_t *s)
             keyfile = mp_get_user_path(NULL, s->global, b->opts->keyfile);
         opened = bd_open_disc(bd, device_tmp, keyfile);
         talloc_free(keyfile);
+#if HAVE_DVDNAV
+        if (!opened && !b->probing) {
+            // Explicit bd:// is also the app's entry point for local ISOs.
+            // Read image bytes directly, without recursively probing the same
+            // .iso as another disc stream. Automatic file probing can still
+            // continue to the ordinary ifo_dvdnav handler as before.
+            b->iso_stream = stream_create(device_tmp,
+                STREAM_READ | STREAM_LOCAL_FS_ONLY | s->stream_origin,
+                s->cancel, s->global);
+            if (b->iso_stream) {
+                talloc_free(device_tmp);
+                MP_VERBOSE(s, "Local image is not Blu-ray; probing DVD-Video.\n");
+                return dvd_proxy_open(s, b);
+            }
+        }
+#endif
         talloc_free(device_tmp);
         if (!opened) {
             if (!b->probing)

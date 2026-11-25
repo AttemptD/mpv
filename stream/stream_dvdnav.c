@@ -57,6 +57,8 @@
 #define TITLE_MENU -1
 #define TITLE_LONGEST -2
 
+extern const stream_info_t stream_info_dvdnav;
+
 #define DVD_TIMEBASE 90000
 #define DVD_TIME_TO_S(x) ((x) / (double)(DVD_TIMEBASE))
 #define DVD_TIME_FROM_S(x) ((int64_t)((x) * DVD_TIMEBASE))
@@ -1718,7 +1720,11 @@ int mp_dvdnav_open_external(stream_t *stream, void *opaque,
         return STREAM_UNSUPPORTED;
     }
 
-    MP_INFO(stream, "Remote DVD-Video ISO detected; using libdvdnav.\n");
+    // A bd:// image can turn out to be DVD-Video. demux_disc uses the stream
+    // identity to select DVD navigation and MPEG-PS track IDs; retaining bd
+    // would discard every DVD packet as an invalid Blu-ray presentation PID.
+    stream->info = &stream_info_dvdnav;
+    MP_INFO(stream, "DVD-Video ISO detected; using libdvdnav.\n");
     return finish_dvdnav_open(stream);
 }
 
