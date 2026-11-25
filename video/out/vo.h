@@ -86,6 +86,7 @@ enum mp_voctrl {
 
     VOCTRL_PERFORMANCE_DATA,            // struct voctrl_performance_data*
     VOCTRL_GET_ANDROID_NATIVE_DOLBY,    // struct voctrl_android_native_dolby*
+    VOCTRL_GET_ANDROID_VIDEO_LAYER,    // struct voctrl_android_video_layer*
     VOCTRL_ANDROID_NATIVE_DOLBY_DECODER_FAILED,
 
     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
@@ -181,6 +182,15 @@ struct mp_frame_perf {
 struct voctrl_android_native_dolby {
     bool active, failed, decoder_failed;
     int64_t frames, osd_updates;
+};
+
+struct voctrl_android_video_layer {
+    bool active;
+    bool latch_stats;
+    bool hdr_buffer_pool;
+    int w, h;
+    int64_t render_id, osd_updates;
+    int64_t submitted, completed, unique_latches, merged_latches, invalid_latches;
 };
 
 struct voctrl_performance_data {

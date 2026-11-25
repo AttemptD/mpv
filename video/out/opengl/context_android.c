@@ -17,12 +17,15 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <dlfcn.h>
 
 #include "video/out/android_common.h"
 #include "android_gl_trace.h"
 #include "egl_helpers.h"
 #include "common/common.h"
 #include "context.h"
+#include "android_video_layer.h"
+#include "ra_gl.h"
 
 struct priv {
     struct GL gl;
@@ -32,6 +35,10 @@ struct priv {
     struct android_gl_trace *trace;
     EGLint last_swap_error;
     bool hdr_active;
+    int32_t (*set_dataspace)(ANativeWindow *, int32_t);
+    void *nativewindow_lib;
+    struct mp_android_video_layer *video_layer;
+    int layer_w, layer_h;
 };
 
 struct config_refine_ctx {
@@ -42,9 +49,6 @@ struct config_refine_ctx {
 static int refine_config(void *user_data, EGLConfig *configs, int num_configs)
 {
     struct config_refine_ctx *refine = user_data;
-    if (!refine->request_hdr)
-        return 0;
-
     // HDR10 output needs a 10-bit swapchain. Prefer RGB10_A2, but allow any
     // config with at least 10 bits per color component.
     for (int n = 0; n < num_configs; n++) {
@@ -52,7 +56,8 @@ static int refine_config(void *user_data, EGLConfig *configs, int num_configs)
         eglGetConfigAttrib(refine->display, configs[n], EGL_RED_SIZE, &r);
         eglGetConfigAttrib(refine->display, configs[n], EGL_GREEN_SIZE, &g);
         eglGetConfigAttrib(refine->display, configs[n], EGL_BLUE_SIZE, &b);
-        if (r >= 10 && g >= 10 && b >= 10)
+        if (refine->request_hdr ? r >= 10 && g >= 10 && b >= 10
+                                : r == 8 && g == 8 && b == 8)
             return n;
     }
 
@@ -62,7 +67,40 @@ static int refine_config(void *user_data, EGLConfig *configs, int num_configs)
 static pl_color_space_t android_preferred_csp(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    return p->hdr_active ? pl_color_space_hdr10 : pl_color_space_srgb;
+    struct pl_color_space csp = pl_color_space_srgb;
+    if (p->hdr_active) {
+        csp = pl_color_space_hdr10;
+        csp.hdr.max_luma = 1000;
+        csp.hdr.min_luma = 0.0001;
+    }
+    return csp;
+}
+
+static void set_hdr_metadata(struct ra_ctx *ctx, const char *extensions)
+{
+    struct priv *p = ctx->priv;
+    if (!p->hdr_active || !extensions ||
+        !strstr(extensions, "EGL_EXT_surface_SMPTE2086_metadata"))
+        return;
+    // The compatibility conversion targets this BT.2020/D65, 1000-nit
+    // output volume. Coordinates and luminances use EGL's 50000 scale.
+    const EGLint metadata[][2] = {
+        {EGL_SMPTE2086_DISPLAY_PRIMARY_RX_EXT, 35400},
+        {EGL_SMPTE2086_DISPLAY_PRIMARY_RY_EXT, 14600},
+        {EGL_SMPTE2086_DISPLAY_PRIMARY_GX_EXT, 8500},
+        {EGL_SMPTE2086_DISPLAY_PRIMARY_GY_EXT, 39850},
+        {EGL_SMPTE2086_DISPLAY_PRIMARY_BX_EXT, 6550},
+        {EGL_SMPTE2086_DISPLAY_PRIMARY_BY_EXT, 2300},
+        {EGL_SMPTE2086_WHITE_POINT_X_EXT, 15635},
+        {EGL_SMPTE2086_WHITE_POINT_Y_EXT, 16450},
+        {EGL_SMPTE2086_MAX_LUMINANCE_EXT, 1000 * EGL_METADATA_SCALING_EXT},
+        {EGL_SMPTE2086_MIN_LUMINANCE_EXT, 5},
+    };
+    bool ok = true;
+    for (int i = 0; i < MP_ARRAY_SIZE(metadata); i++)
+        ok = eglSurfaceAttrib(p->egl_display, p->egl_surface,
+                              metadata[i][0], metadata[i][1]) && ok;
+    MP_INFO(ctx, "HDR output mastering metadata %s.\n", ok ? "accepted" : "rejected");
 }
 
 static bool android_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
@@ -75,6 +113,13 @@ static bool android_set_color(struct ra_ctx *ctx, struct mp_image_params *params
 static void android_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+    if (p->video_layer) {
+        mp_android_video_layer_present(p->video_layer);
+        return;
+    }
+    if (p->hdr_active && p->set_dataspace)
+        p->set_dataspace(vo_android_native_window(ctx->vo),
+            (6 << 16) | (7 << 22) | (1 << 27)); // BT.2020 / ST2084 / full RGB
     if (eglSwapBuffers(p->egl_display, p->egl_surface)) {
         p->last_swap_error = EGL_SUCCESS;
     } else {
@@ -87,10 +132,17 @@ static void android_swap_buffers(struct ra_ctx *ctx)
     }
 }
 
+static bool android_layer_acquire(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    return !p->video_layer || mp_android_video_layer_acquire(p->video_layer);
+}
+
 static void android_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
     ra_gl_ctx_uninit(ctx);
+    mp_android_video_layer_destroy(&p->video_layer);
     android_gl_trace_destroy(p->trace);
 
     if (p->egl_surface) {
@@ -102,6 +154,38 @@ static void android_uninit(struct ra_ctx *ctx)
         eglDestroyContext(p->egl_display, p->egl_context);
 
     vo_android_uninit(ctx->vo);
+    if (p->nativewindow_lib) dlclose(p->nativewindow_lib);
+}
+
+static bool android_refresh_parent(struct ra_ctx *ctx, EGLConfig config,
+                                   ANativeWindow *window, int width, int height)
+{
+    struct priv *p = ctx->priv;
+    EGLint format;
+    if (!eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &format) ||
+        ANativeWindow_setBuffersGeometry(window, width, height, format) != 0)
+        return false;
+    EGLSurface parent = eglCreateWindowSurface(p->egl_display, config,
+        (EGLNativeWindowType)window, NULL);
+    if (parent == EGL_NO_SURFACE) return false;
+    bool ok = eglMakeCurrent(p->egl_display, parent, parent, p->egl_context);
+    if (ok) {
+        // A normal player can leave an old force-window buffer on BLAST.
+        // Its dimensions clip/scale child SurfaceControls even after resizing
+        // the holder. Replace it once at the new size; video stays on the
+        // independent YUV layer and never copies through this RGB buffer.
+        p->gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+        p->gl.Disable(GL_SCISSOR_TEST);
+        p->gl.ClearColor(0, 0, 0, 0);
+        p->gl.Clear(GL_COLOR_BUFFER_BIT);
+        ok = eglSwapBuffers(p->egl_display, parent);
+        p->gl.Finish();
+    }
+    if (!eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface, p->egl_context))
+        ok = false;
+    eglDestroySurface(p->egl_display, parent);
+    if (ok) MP_VERBOSE(ctx, "Refreshed direct-video parent buffer: %dx%d.\n", width, height);
+    return ok;
 }
 
 static bool android_init(struct ra_ctx *ctx)
@@ -119,7 +203,7 @@ static bool android_init(struct ra_ctx *ctx)
 
     struct config_refine_ctx refine = {
         .display = p->egl_display,
-        .request_hdr = ctx->vo->opts->android_hdr_output,
+        .request_hdr = ctx->vo->opts->android_hdr_output && !ctx->vo->opts->android_video_layer,
     };
     EGLConfig config;
     if (!mpegl_create_context_cb(ctx, p->egl_display, (struct mpegl_cb) {
@@ -129,6 +213,37 @@ static bool android_init(struct ra_ctx *ctx)
         goto fail;
 
     ANativeWindow *native_window = vo_android_native_window(ctx->vo);
+    if (ctx->vo->opts->android_video_layer) {
+        if (strcmp(ctx->vo->driver->name, "gpu-next")) {
+            MP_ERR(ctx, "android-video-layer requires gpu-next.\n");
+            goto fail;
+        }
+        p->egl_surface = eglCreatePbufferSurface(p->egl_display, config,
+            (EGLint[]){EGL_WIDTH,16,EGL_HEIGHT,16,EGL_NONE});
+        if (p->egl_surface == EGL_NO_SURFACE ||
+            !eglMakeCurrent(p->egl_display,p->egl_surface,p->egl_surface,p->egl_context))
+            goto fail;
+        mpegl_load_functions(&p->gl, ctx->log);
+        if (p->gl.es < 300 || !gl_check_extension(p->gl.extensions, "GL_EXT_YUV_target"))
+            goto fail;
+        if (!vo_android_surface_size(ctx->vo, &p->layer_w, &p->layer_h) ||
+            !android_refresh_parent(ctx, config, native_window, p->layer_w, p->layer_h)) {
+            MP_ERR(ctx, "Could not refresh the direct-video parent buffer.\n");
+            goto fail;
+        }
+        p->hdr_active = ctx->vo->opts->android_hdr_output;
+        if (!ra_gl_ctx_init(ctx, &p->gl, (struct ra_ctx_params){
+                .preferred_csp=android_preferred_csp, .set_color=android_set_color,
+                .check_visible=android_layer_acquire,
+                .swap_buffers=android_swap_buffers}))
+            goto fail;
+        p->video_layer = mp_android_video_layer_create(ctx, native_window,
+            p->layer_w, p->layer_h, p->hdr_active);
+        if (!p->video_layer) goto fail;
+        ra_gl_ctx_resize(ctx->swapchain, p->layer_w,p->layer_h,
+            mp_android_video_layer_fbo(p->video_layer));
+        return true;
+    }
     EGLint format;
     eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &format);
     ANativeWindow_setBuffersGeometry(native_window, 0, 0, format);
@@ -141,8 +256,10 @@ static bool android_init(struct ra_ctx *ctx)
     const char *extensions = eglQueryString(p->egl_display, EGL_EXTENSIONS);
     bool pq_supported = extensions &&
         strstr(extensions, "EGL_EXT_gl_colorspace_bt2020_pq");
-    bool use_hdr = refine.request_hdr && pq_supported &&
+    bool use_hdr = refine.request_hdr &&
                    red_size >= 10 && green_size >= 10 && blue_size >= 10;
+    if (use_hdr && !pq_supported)
+        MP_INFO(ctx, "Probing a PQ EGL surface despite the missing extension advertisement.\n");
     const EGLint hdr_attribs[] = {
         EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_BT2020_PQ_EXT,
         EGL_NONE,
@@ -165,7 +282,27 @@ static bool android_init(struct ra_ctx *ctx)
         goto fail;
     }
 
+    // Some Android TV EGL drivers omit the PQ EGL extension but support the
+    // public NDK native-window dataspace API. The shader still generates real
+    // PQ pixels; this sets their matching contract, not a relabelled SDR image.
+    if (!use_hdr && refine.request_hdr && red_size >= 10 && green_size >= 10 && blue_size >= 10) {
+        p->set_dataspace = (void *)dlsym(RTLD_DEFAULT, "ANativeWindow_setBuffersDataSpace");
+        if (!p->set_dataspace) {
+            p->nativewindow_lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_LOCAL);
+            if (p->nativewindow_lib)
+                p->set_dataspace = (void *)dlsym(p->nativewindow_lib, "ANativeWindow_setBuffersDataSpace");
+        }
+        if (p->set_dataspace && !p->set_dataspace(native_window,
+                (6 << 16) | (7 << 22) | (1 << 27))) {
+            use_hdr = true;
+            MP_INFO(ctx, "PQ output requested through NDK native-window dataspace.\n");
+        } else {
+            MP_WARN(ctx, "Native-window PQ dataspace request unavailable or rejected.\n");
+            p->set_dataspace = NULL;
+        }
+    }
     p->hdr_active = use_hdr;
+    set_hdr_metadata(ctx, extensions);
     MP_INFO(ctx, "Android output colorspace: %s (%d/%d/%d-bit EGL)\n",
             p->hdr_active ? "BT.2020/PQ HDR10" : "sRGB SDR",
             red_size, green_size, blue_size);
@@ -204,6 +341,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
     if (!vo_android_surface_size(ctx->vo, &w, &h))
         return false;
 
+    struct priv *p = ctx->priv;
+    if (p->video_layer) {
+        if (w != p->layer_w || h != p->layer_h) {
+            MP_VERBOSE(ctx, "Android video-layer size changed; recreate the output.\n");
+            return false;
+        }
+        ctx->vo->dwidth=w; ctx->vo->dheight=h;
+        return true;
+    }
+
     // Update window geometry to prevent screen tearing
     ANativeWindow *native_window = vo_android_native_window(ctx->vo);
     if (native_window) {
@@ -219,6 +366,11 @@ static bool android_reconfig(struct ra_ctx *ctx)
 
 static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
+    struct priv *p = ctx->priv;
+    if (request == VOCTRL_GET_ANDROID_VIDEO_LAYER && p->video_layer) {
+        mp_android_video_layer_get_stats(p->video_layer, arg);
+        return VO_TRUE;
+    }
     return VO_NOTIMPL;
 }
 

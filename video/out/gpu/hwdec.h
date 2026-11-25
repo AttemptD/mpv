@@ -77,6 +77,10 @@ struct ra_hwdec_mapper {
     // The common code won't mess with these, so you can e.g. set them in the
     // .init() callback.
     struct ra_tex *tex[4];
+
+    // Optional borrowed transform for an Android raw-YUV external texture.
+    // The renderer applies it before interpreting the tagged RGB output.
+    const struct pl_custom_lut *color_lut;
 };
 
 // This can be used to map frames of a specific hw format as GL textures.

@@ -89,10 +89,26 @@ typedef struct mp_vo_opts {
     struct m_geometry android_surface_size;
     bool android_hdr_output;
     bool android_native_dolby;
+    bool android_native_dolby_hdr;
     int android_native_hdr;
+    bool android_native_sdr;
     bool android_native_hdr_p7_base;
     int64_t android_native_dolby_surface;
     bool android_dovi_yuv;
+    bool android_surface_drain;
+    bool android_hevc_mc10;
+    bool android_software_color_lut;
+    bool android_require_hwdec;
+    bool android_color_lut;
+    int android_color_lut_size;
+    int android_color_lut_format;
+    bool android_color_lut_3d;
+    bool android_color_lut_direct;
+    bool android_video_layer;
+    bool android_video_layer_hdr_pool;
+    int android_video_layer_contiguous;
+    int android_video_layer_format;
+    int android_video_layer_sync;
     bool android_dovi_dual;
     bool android_native_dolby_p7_mel;
 
@@ -352,6 +368,7 @@ typedef struct MPOpts {
     bool cache_pause;
     bool cache_pause_initial;
     float cache_pause_wait;
+    float cache_pause_seek_wait;
 
     struct image_writer_opts *screenshot_image_opts;
     char *screenshot_template;

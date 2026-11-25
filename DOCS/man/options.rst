@@ -5669,6 +5669,12 @@ Cache
     ends before that for some other reason (like file end or maximum configured
     cache size reached), playback resumes earlier.
 
+``--cache-pause-seek-wait=<seconds>``
+    Allow a smaller packet buffer after a timeline seek during network playback.
+    The default of -1 uses ``--cache-pause-wait``. Startup and ordinary
+    underruns continue to use the normal threshold. Requires
+    ``--cache-pause-initial=yes`` to buffer before a restart.
+
 ``--cache-pause-initial=<yes|no>``
     Enter "buffering" mode before starting playback (default: no). This can be
     used to ensure playback starts smoothly, in exchange for waiting some time
@@ -5949,9 +5955,11 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     Nearby forward seeks also read through gaps of up to ``--curl-buffer-size``
     bytes on the existing connection, retaining the skipped bytes in this cache.
 
-    On a distant cache miss, collects up to 4 MiB of prefetch, bounded by the
-    curl ring buffer and this cache size. The collection deadline is one
-    second after starting the request; normal first-byte waiting still applies.
+    On a distant cache miss, collects up to 16 MiB of prefetch, bounded by the
+    curl ring buffer and one quarter of this cache size. The default 4 MiB
+    ring collects for at most one second after starting the request; larger
+    windows collect for at most four seconds (one second per 4 MiB window).
+    Normal first-byte waiting still applies.
     Ignored for non-seekable, unknown-size and non-HTTP streams, and for disc
     image readers which already maintain their own raw-byte cache.
 
@@ -7347,6 +7355,12 @@ them.
     Request a 10-bit BT.2020/PQ EGL surface on Android. If a compatible
     EGLConfig or ``EGL_EXT_gl_colorspace_bt2020_pq`` is unavailable, the
     Android gpu context falls back to an SDR sRGB surface. (Default: no.)
+
+``--android-require-hwdec=<yes|no>``
+    Stop video decoding if all requested, eligible hardware decoding methods
+    fail, instead of falling back to a CPU decoder (default: no). Retries
+    between the selected hardware methods are retained. Explicit ``hwdec=no``
+    and streams excluded by ``hwdec-codecs`` keep their existing behavior.
 
 ``--android-dovi-yuv=<yes|no>``
     Experimental MediaCodec Dolby Vision raw-YUV bridge (default: no).

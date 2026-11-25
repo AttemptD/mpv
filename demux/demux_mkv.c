@@ -2507,7 +2507,7 @@ static int read_mkv_segment_header(demuxer_t *demuxer, int64_t *segment_end)
     return 0;
 }
 
-static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+static int demux_mkv_open_headers(demuxer_t *demuxer, enum demux_check check)
 {
     stream_t *s = demuxer->stream;
     mkv_demuxer_t *mkv_d;
@@ -2636,6 +2636,22 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
     probe_if_image(demuxer);
 
     return 0;
+}
+
+static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+{
+    // SeekHead can send the reader to small metadata elements separated by
+    // large parts of the movie. Let these reads proceed as bytes arrive.
+    struct stream *stream = demuxer->stream;
+    bool probing = true;
+    bool supported = stream_control(stream, STREAM_CTRL_SET_HEADER_PROBING,
+                                    &probing) == STREAM_OK;
+    int result = demux_mkv_open_headers(demuxer, check);
+    if (supported) {
+        probing = false;
+        stream_control(stream, STREAM_CTRL_SET_HEADER_PROBING, &probing);
+    }
+    return result;
 }
 
 // Read the laced block data at the current stream position (until endpos as
@@ -3612,6 +3628,10 @@ static struct mkv_index *seek_with_cues(struct demuxer *demuxer, int seek_id,
 static void demux_mkv_seek(demuxer_t *demuxer, double seek_pts, int flags)
 {
     mkv_demuxer_t *mkv_d = demuxer->priv;
+    // Cue and cluster reads for a timeline seek should receive the first
+    // available bytes. The curl ring keeps downloading after returning them.
+    bool bypass = true;
+    stream_control(demuxer->stream, STREAM_CTRL_SET_SEEK_PREFETCH_BYPASS, &bypass);
     int64_t old_pos = stream_tell(demuxer->stream);
     uint64_t v_tnum = -1;
     uint64_t a_tnum = -1;
@@ -3695,6 +3715,8 @@ static void demux_mkv_seek(demuxer_t *demuxer, double seek_pts, int flags)
     mkv_d->v_skip_to_keyframe = st_active[STREAM_VIDEO];
     mkv_d->a_skip_to_keyframe = st_active[STREAM_AUDIO];
     mkv_d->a_skip_preroll = mkv_d->a_skip_to_keyframe;
+    bypass = false;
+    stream_control(demuxer->stream, STREAM_CTRL_SET_SEEK_PREFETCH_BYPASS, &bypass);
 }
 
 static void probe_last_timestamp(struct demuxer *demuxer, int64_t start_pos)

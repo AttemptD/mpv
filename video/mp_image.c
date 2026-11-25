@@ -1208,12 +1208,18 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     dst->params.transfer_orig = dst->params.color.transfer;
     dst->params.sys_orig = dst->params.repr.sys;
     AVBufferRef *dovi = NULL;
+    // A P7 HDR10 base frame carries only a classification marker, never RPU
+    // color transforms. The native MEL decoder independently verifies it.
+    const AVDictionaryEntry *mel = av_dict_get(src->metadata, "mpv.dovi.mel", NULL, 0);
+    if (mel) dst->params.dovi_mel = !strcmp(mel->value, "1");
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_DOVI_METADATA);
     if (sd) {
 #ifdef PL_HAVE_LAV_DOLBY_VISION
         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
         dst->params.dovi_mel = mp_dovi_is_mel(metadata);
-        dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
+        // The mapper fills only active curves/orders. Zero unused coefficients
+        // and padding so equivalent RPUs have stable cache keys.
+        dst->dovi = dovi = av_buffer_allocz(sizeof(struct pl_dovi_metadata));
         MP_HANDLE_OOM(dovi);
         pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,
                                (void *)dst->dovi->data, metadata);

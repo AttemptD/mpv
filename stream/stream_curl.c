@@ -20,6 +20,9 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 
 #include <curl/curl.h>
 
@@ -173,6 +176,10 @@ struct priv {
     struct curl_slist *headers;
     char *url;
     const struct curl_scheme *scheme;
+    bool can_reuse_seek_url;
+    char *seek_url;
+    char *seek_etag;
+    bool use_seek_url;
 
     // Stream parameters
     bool seekable;
@@ -203,6 +210,9 @@ struct priv {
     // Logical reader and the beginning of the producer's unread ring. Cached
     // seeks can move the reader without canceling the current HTTP transfer.
     uint64_t read_pos, network_pos;
+    bool probing_headers;
+    bool seek_prefetch_bypass;
+    bool read_seek_without_prefetch;
     size_t seek_prefetch;
     int64_t seek_prefetch_until;
     struct mp_curl_cache seek_cache;
@@ -220,17 +230,25 @@ static bool seek_cache_enabled(struct priv *p)
            p->scheme->proto == MP_CURL_PROTO_HTTP;
 }
 
+// Playback can amortize an HTTP request by reading through a gap. During
+// header probing a large gap may be an attachment or an unused cluster.
+static size_t read_through_limit(const struct priv *p)
+{
+    return p->probing_headers ? MPMIN(p->buffer_size, 256 * 1024) : p->buffer_size;
+}
+
 // Save unread prefetch before replacing a transfer. Previously a track switch
 // discarded up to curl-buffer-size bytes, only to fetch them again on return.
 // Caller holds p->mtx; only validated, byte-addressable body data is retained.
-static void cache_unread(struct priv *p)
+static void cache_unread(struct priv *p, size_t count)
 {
-    if (!seek_cache_enabled(p) || !p->count)
+    if (!seek_cache_enabled(p) || !count)
         return;
-    size_t first = MPMIN(p->count, p->buffer_size - p->head);
+    mp_assert(count <= p->count);
+    size_t first = MPMIN(count, p->buffer_size - p->head);
     mp_curl_cache_put(&p->seek_cache, p->network_pos, p->buffer + p->head, first);
     mp_curl_cache_put(&p->seek_cache, p->network_pos + first,
-                      p->buffer, p->count - first);
+                      p->buffer, count - first);
 }
 
 // Curl thread
@@ -286,8 +304,9 @@ static void run_cmd(void *arg)
             c->p->active = false;
         }
         mp_mutex_lock(&c->p->mtx);
+        bool fast_seek = c->p->seek_prefetch_bypass || c->p->read_seek_without_prefetch;
         if (c->drop) {
-            cache_unread(c->p);
+            cache_unread(c->p, c->p->count);
             uint64_t distance = c->pos > c->p->network_pos
                               ? c->pos - c->p->network_pos
                               : c->p->network_pos - c->pos;
@@ -295,19 +314,27 @@ static void run_cmd(void *arg)
             // first tiny packet arrives. Amortize that request by retaining a
             // window first. Stay below capacity so curl's full-buffer pause
             // can never leave the reader waiting for an impossible size.
-            c->p->seek_prefetch = seek_cache_enabled(c->p) &&
+            c->p->seek_prefetch = !fast_seek && !c->p->probing_headers &&
+                                  seek_cache_enabled(c->p) &&
                                   distance > c->p->buffer_size
                 ? MPMIN(c->p->buffer_size - CURL_MAX_WRITE_SIZE,
-                        MPMIN(4 << 20, c->p->seek_cache.count * c->p->seek_cache.block_size))
+                        MPMIN(16 << 20, c->p->seek_cache.count * c->p->seek_cache.block_size / 4))
                 : 0;
+            // A larger ring amortizes connection setup on slower TV clients.
+            // Keep the normal 4 MiB ring's deadline unchanged, with a strict
+            // four-second collection cap even for user-configured huge rings.
+            int collect_ms = c->p->seek_prefetch
+                ? 1000 * (1 + (c->p->seek_prefetch - 1) / (4 << 20)) : 0;
             c->p->seek_prefetch_until = c->p->seek_prefetch
-                                    ? mp_time_ns() + MP_TIME_MS_TO_NS(1000) : 0;
+                ? mp_time_ns() + MP_TIME_MS_TO_NS(collect_ms)
+                : 0;
             c->p->head = c->p->tail = c->p->count = 0;
             c->p->network_pos = c->pos;
         }
         c->p->paused = false;
         c->p->stream_eof = false;
         c->p->stream_error = false;
+        c->p->use_seek_url = fast_seek && c->p->seek_url;
         mp_cond_broadcast(&c->p->cond);
         mp_mutex_unlock(&c->p->mtx);
         c->p->request_start = c->pos;
@@ -367,6 +394,12 @@ static bool curl_failed(struct curl_ctx *ctx, struct mp_log *log, int level)
 static MP_THREAD_VOID curl_thread(void *arg)
 {
     mp_thread_set_name("curl");
+#ifdef __ANDROID__
+    // libmpv can be created on Android's boosted UI thread. A network refill
+    // inherits that nice value and can preempt timed rendering for an entire burst.
+    if (getpriority(PRIO_PROCESS, 0) < 0)
+        setpriority(PRIO_PROCESS, 0, 0);
+#endif
     struct curl_ctx *ctx = arg;
 
     CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
@@ -542,6 +575,49 @@ static void parse_content_range(CURL *c, int64_t *out_start, int64_t *out_end,
         *out_end = v;
 }
 
+static bool seek_url_is_https(const char *url)
+{
+    if (!url || bstrcasecmp(mp_split_proto(bstr0(url), NULL), bstr0("https")) != 0)
+        return false;
+    CURLU *parsed = curl_url();
+    bool valid = parsed && curl_url_set(parsed, CURLUPART_URL, url,
+                                       CURLU_DISALLOW_USER) == CURLUE_OK;
+    curl_url_cleanup(parsed);
+    return valid;
+}
+
+static bool matches_seek_range(struct priv *p, long resp, int64_t start,
+                               int64_t end, int64_t total)
+{
+    if (resp != 206 || start < 0 || start != p->request_start ||
+        end < start || end >= total || total != p->content_size)
+        return false;
+    const char *encoding = header_value(p->curl, "Content-Encoding");
+    return !encoding || strcasecmp(encoding, "identity") == 0;
+}
+
+static void remember_seek_url(struct priv *p)
+{
+    long redirects = 0;
+    char *effective = NULL;
+    curl_easy_getinfo(p->curl, CURLINFO_REDIRECT_COUNT, &redirects);
+    if (redirects)
+        curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective);
+    if (!seek_url_is_https(effective)) {
+        TA_FREEP(&p->seek_url);
+        TA_FREEP(&p->seek_etag);
+        return;
+    }
+    if (p->seek_url && strcmp(p->seek_url, effective) == 0)
+        return;
+    TA_FREEP(&p->seek_url);
+    TA_FREEP(&p->seek_etag);
+    p->seek_url = talloc_strdup(p, effective);
+    const char *etag = header_value(p->curl, "ETag");
+    if (etag && etag[0] == '"')
+        p->seek_etag = talloc_strdup(p, etag);
+}
+
 static void finalize_probe(struct priv *p)
 {
     if (mp_msg_test(p->log, MSGL_DEBUG)) {
@@ -613,15 +689,25 @@ static void on_http_header(struct priv *p, struct bstr line)
 
     long resp = 0;
     curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
-    if (resp < 200 || (resp >= 300 && resp < 400))
+    if (resp < 200 || (!p->use_seek_url && resp >= 300 && resp < 400))
         return;
 
     int64_t range_start, range_end, range_total;
     parse_content_range(p->curl, &range_start, &range_end, &range_total);
     p->reply_end = resp == 206 ? range_end : -1;
 
+    if (p->use_seek_url) {
+        const char *etag = p->seek_etag ? header_value(p->curl, "ETag") : NULL;
+        p->reply_rejected = !matches_seek_range(p, resp, range_start, range_end, range_total) ||
+                            (p->seek_etag && (!etag || strcmp(etag, p->seek_etag) != 0));
+        return;
+    }
+
     if (p->probed) {
         check_http_reply(p, resp, range_start, range_total);
+        if (p->can_reuse_seek_url && !p->reply_rejected &&
+            matches_seek_range(p, resp, range_start, range_end, range_total))
+            remember_seek_url(p);
         return;
     }
 
@@ -677,6 +763,10 @@ static void on_http_header(struct priv *p, struct bstr line)
     if (cd)
         p->server_filename = mp_parse_content_disposition(p, p->s, bstr0(cd));
 
+    if (p->can_reuse_seek_url && p->seekable &&
+        matches_seek_range(p, resp, range_start, range_end, range_total))
+        remember_seek_url(p);
+
     p->stream_ok = true;
 done:
     finalize_probe(p);
@@ -716,6 +806,8 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
     switch (p->scheme->proto) {
     case MP_CURL_PROTO_HTTP:
         on_http_header(p, line);
+        if (p->use_seek_url && p->reply_rejected)
+            return CURL_WRITEFUNC_ERROR;
         break;
     case MP_CURL_PROTO_FTP:
         probe_ftp(p, line);
@@ -835,6 +927,16 @@ static void start_request(struct priv *p)
         return;
     }
 
+    if (p->can_reuse_seek_url &&
+        (!check_setopt(p, "CURLOPT_URL", curl_easy_setopt(p->curl, CURLOPT_URL,
+                     p->use_seek_url ? p->seek_url : p->url)) ||
+         !check_setopt(p, "CURLOPT_FOLLOWLOCATION", curl_easy_setopt(p->curl,
+                     CURLOPT_FOLLOWLOCATION, p->use_seek_url ? 0L : 1L))))
+    {
+        request_failed(p);
+        return;
+    }
+
     p->request_received = 0;
     p->reply_end = -1;
     p->reply_rejected = false;
@@ -879,6 +981,16 @@ static void on_done(struct priv *p, CURLcode code)
     // Roll completed bytes into request_start so retries and chunk
     // continuations resume at the next missing byte.
     uint64_t received = p->request_received;
+    if (p->use_seek_url && !aborted && !received) {
+        // An expired or incompatible redirect can be renewed through the
+        // original URL. No bytes from the rejected response entered the ring.
+        MP_DBG(p, "Renewing HTTPS media redirect after a failed seek request\n");
+        p->use_seek_url = false;
+        TA_FREEP(&p->seek_url);
+        TA_FREEP(&p->seek_etag);
+        start_request(p);
+        return;
+    }
     if (received)
         p->retry_count = 0;
     p->request_start += received;
@@ -1098,7 +1210,9 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
         {
             size_t skip = p->read_pos - p->network_pos;
             // Keep skipped prefetch available for a later backward seek.
-            cache_unread(p);
+            // Only the skipped prefix is leaving the live ring. Recopying
+            // all unread prefetch for every small gap wastes memory bandwidth.
+            cache_unread(p, skip);
             p->head = (p->head + skip) % p->buffer_size;
             p->count -= skip;
             p->network_pos = p->read_pos;
@@ -1125,14 +1239,14 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
         // connection and read through the small gap instead of canceling it
         // after every audio chunk. Unread data is retained before advancing.
         if (p->read_pos > p->network_pos &&
-            p->read_pos - p->network_pos <= p->buffer_size &&
+            p->read_pos - p->network_pos <= read_through_limit(p) &&
             !p->stream_eof && !p->stream_error)
         {
             if (!p->count) {
                 mp_cond_wait(&p->cond, &p->mtx);
                 continue;
             }
-            cache_unread(p);
+            cache_unread(p, p->count);
             p->network_pos += p->count;
             p->head = p->tail;
             p->count = 0;
@@ -1173,6 +1287,7 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     size_t copy = MPMIN((size_t)max_len, p->count);
     p->seek_prefetch = 0;
     if (copy > 0) {
+        p->read_seek_without_prefetch = false;
         size_t head_chunk = MPMIN(p->buffer_size - p->head, copy);
         memcpy(buffer, p->buffer + p->head, head_chunk);
         memcpy((char *)buffer + head_chunk, p->buffer, copy - head_chunk);
@@ -1202,11 +1317,14 @@ static int curl_seek(struct stream *s, int64_t pos)
         return 0;
     mp_mutex_lock(&p->mtx);
     p->read_pos = pos;
+    // A seek can start in the raw cache and need a new transfer later, after
+    // the demuxer has finished positioning the stream.
+    p->read_seek_without_prefetch = p->seek_prefetch_bypass;
     bool cached = seek_cache_enabled(p) &&
         (mp_curl_cache_has(&p->seek_cache, pos) ||
          ((uint64_t)pos >= p->network_pos &&
           ((uint64_t)pos - p->network_pos <= p->count ||
-           ((uint64_t)pos - p->network_pos <= p->buffer_size &&
+           ((uint64_t)pos - p->network_pos <= read_through_limit(p) &&
             !p->stream_eof && !p->stream_error))));
     mp_mutex_unlock(&p->mtx);
     if (cached)
@@ -1228,6 +1346,20 @@ static int curl_control(struct stream *s, int cmd, void *arg)
 {
     struct priv *p = s->priv;
     switch (cmd) {
+    case STREAM_CTRL_SET_HEADER_PROBING:
+        mp_mutex_lock(&p->mtx);
+        p->probing_headers = *(bool *)arg;
+        mp_mutex_unlock(&p->mtx);
+        return STREAM_OK;
+    case STREAM_CTRL_SET_SEEK_PREFETCH_BYPASS:
+        mp_mutex_lock(&p->mtx);
+        p->seek_prefetch_bypass = *(bool *)arg;
+        if (p->seek_prefetch_bypass) {
+            p->seek_prefetch = 0;
+            p->seek_prefetch_until = 0;
+        }
+        mp_mutex_unlock(&p->mtx);
+        return STREAM_OK;
     case STREAM_CTRL_GET_METADATA: {
         mp_mutex_lock(&p->mtx);
         struct mp_tags *tags = mp_icy_get_metadata(p->icy, s);
@@ -1318,6 +1450,14 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     p->read_pos = p->network_pos = p->start_offset;
     mp_curl_cache_init(&p->seek_cache,
         args->flags & STREAM_NO_SEEK_CACHE ? 0 : p->opts->seek_cache_size);
+    // Start a seek at an already verified HTTPS destination only when the
+    // transfer has no credentials or custom headers tied to its origin.
+    struct mp_network_opts *net = p->net_opts;
+    p->can_reuse_seek_url = p->seek_cache.count && !p->start_offset && !p->request_end &&
+        net->tls_verify && !net->cookies_enabled && !(net->referrer && net->referrer[0]) &&
+        !(net->http_header_fields && net->http_header_fields[0]) &&
+        !net->tls_cert_file && !net->tls_key_file &&
+        !(net->http_proxy && net->http_proxy[0]) && seek_url_is_https(p->url);
 
     mp_mutex_init(&p->mtx);
     mp_cond_init(&p->cond);

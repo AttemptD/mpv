@@ -19,6 +19,7 @@ bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_ctx_params params);
 
 // Call this any time the window size or main framebuffer changes
 void ra_gl_ctx_resize(struct ra_swapchain *sw, int w, int h, int fbo);
+int ra_gl_ctx_main_fbo(struct ra_swapchain *sw);
 
 // These functions are normally set in the ra_swapchain->fns, but if an
 // implementation has a need to override this fns struct with custom functions

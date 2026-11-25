@@ -161,7 +161,10 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
 
         ctx->swapchain = pl_opengl_create_swapchain(opengl, pl_opengl_swapchain_params(
             .max_swapchain_depth = vo->opts->swapchain_depth,
-            .framebuffer.flipped = gl->flipped,
+            .framebuffer.flipped = vo->opts->android_video_layer || gl->flipped,
+            .framebuffer.id = ra_gl_ctx_main_fbo(ctx->ra_ctx->swapchain),
+            .framebuffer.raw_yuv = vo->opts->android_video_layer &&
+                                   !vo->opts->android_video_layer_format,
         ));
         if (!ctx->swapchain)
             goto err_out;

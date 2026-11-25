@@ -43,6 +43,7 @@
 #include "video/mp_image.h"
 #include "video/out/placebo/ra_pl.h"
 #include "placebo/utils.h"
+#include "placebo/color_lut.h"
 #include "gpu/context.h"
 #include "gpu/hwdec.h"
 #include "gpu/utils.h"
@@ -50,6 +51,11 @@
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
 #include "gpu_next/context.h"
+
+#if HAVE_EGL_ANDROID
+#include <EGL/egl.h>
+#include "video/out/opengl/android_video_layer.h"
+#endif
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 #include <libplacebo/opengl.h>
@@ -145,6 +151,14 @@ struct priv {
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
     struct osd_state osd_state;
+#if HAVE_EGL_ANDROID
+    struct mp_android_captions *android_captions;
+    AVBufferRef *software_lut;
+    pl_dispatch software_lut_dispatch;
+    pl_shader_obj software_lut_state;
+    bool software_lut_failed;
+    int software_lut_updates;
+#endif
 
     uint64_t last_id;
     uint64_t osd_sync;
@@ -591,6 +605,11 @@ struct frame_priv {
     struct osd_state subs;
     uint64_t osd_sync;
     struct ra_hwdec *hwdec;
+    struct pl_custom_lut color_lut;
+#if HAVE_EGL_ANDROID
+    AVBufferRef *software_lut;
+    struct pl_color_space software_source_color;
+#endif
     // Optional Dolby Vision FEL.
     struct ra_hwdec *el_hwdec;
     pl_tex el_tex[4];
@@ -712,9 +731,12 @@ static bool slot_reconfig(struct priv *p, struct hwdec_slot *s,
     if (s->mapper) {
         if (mp_image_params_static_equal(par, &s->mapper->src_params)) {
             s->mapper->src_params.repr.dovi = par->repr.dovi;
-            s->mapper->dst_params.repr.dovi = par->repr.dovi;
             s->mapper->src_params.color.hdr = par->color.hdr;
-            s->mapper->dst_params.color.hdr = par->color.hdr;
+            if (!p->ra_ctx->vo->opts->android_color_lut ||
+                s->mapper->dst_params.repr.sys != PL_COLOR_SYSTEM_RGB) {
+                s->mapper->dst_params.repr.dovi = par->repr.dovi;
+                s->mapper->dst_params.color.hdr = par->color.hdr;
+            }
             return true;
         }
         slot_unmap(p, s);
@@ -728,7 +750,10 @@ static bool slot_reconfig(struct priv *p, struct hwdec_slot *s,
         MP_ERR(p, "Initializing texture for hardware decoding failed.\n");
         return false;
     }
-    s->timer = timer_pool_create(p->ra_ctx->ra);
+    // LUT generation has its own libplacebo GPU timer. GL_TIME_ELAPSED
+    // queries cannot nest, even across the two GL wrappers.
+    if (!p->ra_ctx->vo->opts->android_color_lut)
+        s->timer = timer_pool_create(p->ra_ctx->ra);
 
     return true;
 }
@@ -762,6 +787,7 @@ static pl_tex hwdec_get_tex(struct priv *p, struct ra_hwdec_mapper *mapper, int 
         struct pl_opengl_wrap_params par = {
             .width = ratex->params.w,
             .height = ratex->params.h,
+            .raw_yuv = mapper->color_lut != NULL,
         };
 
         ra_gl_get_format(ratex->params.format, &par.iformat,
@@ -830,15 +856,15 @@ static bool slot_acquire(struct priv *p, struct hwdec_slot *s,
         slot_unmap(p, s);
 
         stats_time_start(p->stats, "hwdec-map");
-        timer_pool_start(s->timer);
+        if (s->timer) timer_pool_start(s->timer);
         int ret = ra_hwdec_mapper_map(s->mapper, mpi);
-        timer_pool_stop(s->timer);
+        if (s->timer) timer_pool_stop(s->timer);
         stats_time_end(p->stats, "hwdec-map");
         if (ret < 0) {
             MP_ERR(p, "Mapping hardware decoded surface failed.\n");
             return false;
         }
-        s->perf = timer_pool_measure(s->timer);
+        s->perf = s->timer ? timer_pool_measure(s->timer) : (struct mp_pass_perf){0};
         s->owner = owner;
     }
 
@@ -997,6 +1023,166 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
     return true;
 }
 
+#if HAVE_EGL_ANDROID
+struct software_color_lut {
+    pl_gpu gpu;
+    pl_tex atlas, volume;
+    struct pl_custom_lut lut;
+    struct mp_image_params source;
+    struct pl_color_space target;
+    bool has_dovi;
+    struct pl_dovi_metadata dovi;
+};
+
+static void software_lut_free(void *opaque, uint8_t *data)
+{
+    struct software_color_lut *lut = opaque;
+    pl_tex_destroy(lut->gpu, &lut->atlas);
+    pl_tex_destroy(lut->gpu, &lut->volume);
+    talloc_free(lut);
+}
+
+static void attach_software_lut(struct vo *vo, struct mp_image *mpi,
+                                const struct mp_image_params *params,
+                                struct frame_priv *fp, struct pl_frame *frame)
+{
+    struct priv *p = vo->priv;
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    struct mp_image_params src = *params;
+    if (!vo->opts->android_software_color_lut || p->software_lut_failed ||
+        fp->hwdec || mpi->enhancement_layer || mpi->film_grain ||
+        frame->lut || frame->profile.len || p->num_user_hooks ||
+        memcmp(&p->pars->color_adjustment, &pl_color_adjustment_neutral,
+               sizeof(pl_color_adjustment_neutral)) ||
+        src.repr.bits.color_depth != 10 || !pl_color_transfer_is_hdr(src.color.transfer) ||
+        !opts->target_trc || pl_color_transfer_is_hdr(opts->target_trc) ||
+        !opts->target_peak || vo->opts->android_hdr_output)
+        return;
+
+    // Exactly the same static target and source transform as the HW+ LUT.
+    // Preserve each frame's Dolby reshaping and matrices, but omit dynamic
+    // exposure statistics from the static BT.2390 mapping.
+    src.color.hdr.avg_pq_y = src.color.hdr.max_pq_y = 0;
+    src.color.hdr.scene_avg = 0;
+    memset(src.color.hdr.scene_max, 0, sizeof(src.color.hdr.scene_max));
+    struct mp_image_params key = src;
+    key.repr.dovi = NULL;
+    bool has_dovi = src.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && src.repr.dovi;
+    struct pl_color_space target = {
+        .primaries = opts->target_prim ? opts->target_prim : PL_COLOR_PRIM_BT_709,
+        .transfer = opts->target_trc,
+        .hdr = {.max_luma = opts->target_peak, .min_luma = opts->target_peak / 1000.0},
+    };
+    pl_color_space_infer_map(&src.color, &target);
+    struct software_color_lut *lut = p->software_lut ? (void *)p->software_lut->data : NULL;
+    bool matches = lut && mp_image_params_equal(&key, &lut->source) &&
+        pl_color_space_equal(&target, &lut->target) && has_dovi == lut->has_dovi &&
+        (!has_dovi || !memcmp(src.repr.dovi, &lut->dovi, sizeof(lut->dovi)));
+    if (!matches) {
+        if (!ra_is_gl(p->ra_ctx->ra))
+            return;
+        GL *gl = ra_gl_get(p->ra_ctx->ra);
+        int n = vo->opts->android_color_lut_size;
+        if (n * n > p->gpu->limits.max_tex_2d_dim)
+            n = 33;
+        if (gl->es < 300 || n > p->gpu->limits.max_tex_3d_dim)
+            return;
+        void (GLAPIENTRY *copy3d)(GLenum, GLint, GLint, GLint, GLint,
+                                  GLint, GLint, GLsizei, GLsizei) =
+            (void *)eglGetProcAddress("glCopyTexSubImage3D");
+        pl_fmt fmt = pl_find_named_fmt(p->gpu,
+            vo->opts->android_color_lut_format ? "rgb10_a2" : "rgba16f");
+        if (!copy3d || !fmt || !(fmt->caps & PL_FMT_CAP_LINEAR) ||
+            !(fmt->caps & PL_FMT_CAP_RENDERABLE))
+            return;
+        lut = talloc_zero(NULL, struct software_color_lut);
+        lut->gpu = p->gpu;
+        lut->atlas = pl_tex_create(p->gpu, pl_tex_params(
+            .w=n, .h=n*n, .format=fmt, .renderable=true, .sampleable=true));
+        lut->volume = pl_tex_create(p->gpu, pl_tex_params(
+            .w=n, .h=n, .d=n, .format=fmt, .sampleable=true));
+        if (!p->software_lut_dispatch)
+            p->software_lut_dispatch = pl_dispatch_create(p->pllog, p->gpu);
+        bool ok = lut->atlas && lut->volume &&
+            mp_color_lut_render(p->gpu, p->software_lut_dispatch, lut->atlas,
+                &p->software_lut_state, &src, &target, n, true);
+        if (ok) {
+            GLuint fbo = 0;
+            pl_opengl_unwrap(p->gpu, lut->atlas, NULL, NULL, &fbo);
+            GLuint texture = pl_opengl_unwrap(p->gpu, lut->volume, NULL, NULL, NULL);
+            GLint old_read, old_texture;
+            gl->GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+            gl->GetIntegerv(GL_TEXTURE_BINDING_3D, &old_texture);
+            gl->BindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+            gl->BindTexture(GL_TEXTURE_3D, texture);
+            ok = fbo && texture && gl->CheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+            for (int z = 0; ok && z < n; z++)
+                copy3d(GL_TEXTURE_3D, 0, 0, 0, z, 0, z*n, n, n);
+            ok = gl->GetError() == GL_NO_ERROR && ok;
+            gl->BindTexture(GL_TEXTURE_3D, old_texture);
+            gl->BindFramebuffer(GL_READ_FRAMEBUFFER, old_read);
+        }
+        if (!ok) {
+            software_lut_free(lut, NULL);
+            p->software_lut_failed = true;
+            MP_WARN(vo, "Software color LUT unavailable; retaining full color conversion.\n");
+            return;
+        }
+        lut->source = key;
+        lut->target = target;
+        lut->has_dovi = has_dovi;
+        if (has_dovi)
+            lut->dovi = *src.repr.dovi;
+        lut->lut = (struct pl_custom_lut){
+            .size={n,n,n}, .volume=lut->volume,
+            .repr_out=pl_color_repr_rgb, .color_out=target,
+        };
+        AVBufferRef *ref = av_buffer_create((uint8_t *)lut, sizeof(*lut),
+            software_lut_free, lut, AV_BUFFER_FLAG_READONLY);
+        if (!ref) {
+            software_lut_free(lut, NULL);
+            return;
+        }
+        av_buffer_unref(&p->software_lut);
+        p->software_lut = ref;
+        if (p->software_lut_updates++ < 8)
+            MP_INFO(vo, "Software color LUT: %d^3, Dolby=%d, target=%.0fnit SDR.\n",
+                n, has_dovi, target.hdr.max_luma);
+    }
+    fp->software_lut = av_buffer_ref(p->software_lut);
+    if (!fp->software_lut)
+        return;
+    // The frame keeps its own LUT reference. A later RPU must not overwrite
+    // a texture still used by an earlier queued frame or a paused redraw.
+    frame->lut = &lut->lut;
+    frame->lut_type = PL_LUT_CONVERSION;
+    fp->software_source_color = frame->color;
+    frame->color = target;
+}
+
+static bool refresh_software_lut(struct priv *p, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct frame_priv *fp = mpi->priv;
+    if (!fp->software_lut)
+        return false;
+    struct software_color_lut *lut = (void *)fp->software_lut->data;
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    bool active = p->ra_ctx->vo->opts->android_software_color_lut &&
+        !p->ra_ctx->vo->opts->android_hdr_output && !p->num_user_hooks &&
+        !p->next_opts->image_lut.lut &&
+        !memcmp(&p->pars->color_adjustment, &pl_color_adjustment_neutral,
+                sizeof(pl_color_adjustment_neutral)) &&
+        opts->target_trc == lut->target.transfer &&
+        opts->target_peak == lut->target.hdr.max_luma &&
+        (!opts->target_prim || opts->target_prim == lut->target.primaries);
+    frame->lut = active ? &lut->lut : p->next_opts->image_lut.lut;
+    frame->lut_type = active ? PL_LUT_CONVERSION : p->next_opts->image_lut.type;
+    frame->color = active ? lut->target : fp->software_source_color;
+    return active;
+}
+#endif
+
 static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                       struct pl_frame *frame)
 {
@@ -1131,6 +1317,14 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     update_lut(p, &p->next_opts->image_lut);
     frame->lut = p->next_opts->image_lut.lut;
     frame->lut_type = p->next_opts->image_lut.type;
+    if (fp->hwdec && p->hwdec.mapper->color_lut) {
+        fp->color_lut = *p->hwdec.mapper->color_lut;
+        frame->lut = &fp->color_lut;
+        frame->lut_type = PL_LUT_CONVERSION;
+    }
+#if HAVE_EGL_ANDROID
+    attach_software_lut(vo, mpi, &par, fp, frame);
+#endif
     return true;
 }
 
@@ -1151,6 +1345,9 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     }
     slot_release_owner(p, &p->hwdec, mpi);
     slot_release_owner(p, &p->el_hwdec, mpi);
+#if HAVE_EGL_ANDROID
+    av_buffer_unref(&fp->software_lut);
+#endif
     talloc_free(mpi);
 }
 
@@ -1376,6 +1573,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
+    bool separate_osd = false;
+#if HAVE_EGL_ANDROID
+    separate_osd = p->android_captions != NULL;
+#endif
     bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
     bool cache_frame = will_redraw || frame->still || p->paused;
     bool can_interpolate = opts->interpolation && frame->display_synced &&
@@ -1643,6 +1844,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     bool strict_sw_params = target_hint && p->next_opts->target_hint_strict;
     apply_target_options(p, &target, hint.hdr.min_luma, strict_sw_params,
                          target_ref_luma, &target_csp);
+    if (vo->opts->android_video_layer) {
+        int format = vo->opts->android_video_layer_format;
+        target.repr = format ? pl_color_repr_rgb :
+            target.color.primaries == PL_COLOR_PRIM_BT_2020
+                ? pl_color_repr_uhdtv : pl_color_repr_hdtv;
+        target.repr.bits.sample_depth = target.repr.bits.color_depth = format == 2 ? 10 : 8;
+    }
     bool clip_gamut = pl_primaries_valid(&target.color.hdr.prim);
     clip_gamut = clip_gamut && target.color.transfer != PL_COLOR_TRC_SCRGB;
     if (clip_gamut) {
@@ -1690,6 +1898,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 #endif
     }
     stats_time_start(p->stats, "osd-update");
+#if HAVE_EGL_ANDROID
+    if (separate_osd) {
+        if (!mp_android_captions_draw(p->android_captions, &p->osd_res,
+                                      frame->current ? frame->current->pts : 0))
+            return false;
+    } else
+#endif
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
@@ -1746,8 +1961,14 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             struct pl_frame *image = (struct pl_frame *) mix.frames[i];
             struct mp_image *mpi = image->user_data;
             struct frame_priv *fp = mpi->priv;
+#if HAVE_EGL_ANDROID
+            // Paused EQ/target changes must also update already queued frames.
+            // A changed source stage needs a different renderer cache key.
+            if (refresh_software_lut(p, image))
+                ((uint64_t *) mix.signatures)[i] ^= UINT64_C(1) << 47;
+#endif
             apply_crop(image, p->src, vo->params->w, vo->params->h);
-            if (opts->blend_subs) {
+            if (opts->blend_subs && !separate_osd) {
                 if (frame->redraw)
                     p->osd_sync++;
                 if (fp->osd_sync < p->osd_sync) {
@@ -1991,10 +2212,15 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     // the resulting mix is the correct frame for this PTS
     struct pl_frame image = *(struct pl_frame *) mix.frames[0];
     struct mp_image *mpi = image.user_data;
+#if HAVE_EGL_ANDROID
+    refresh_software_lut(p, &image);
+#endif
 
     // Clear reference luminance before taking a screenshot, we want screenshot
     // to be independent of the system reference luminance.
-    if (!pl_color_transfer_is_hdr(image.color.transfer))
+    if (!pl_color_transfer_is_hdr(image.color.transfer) &&
+        !((vo->opts->android_color_lut || vo->opts->android_software_color_lut) &&
+          image.lut_type == PL_LUT_CONVERSION))
         image.color.hdr.max_luma = 0;
 
     struct mp_rect src = p->src, dst = p->dst;
@@ -2270,6 +2496,21 @@ static int control(struct vo *vo, uint32_t request, void *data)
         p->want_reset = false;
         return VO_TRUE;
 
+#if HAVE_EGL_ANDROID
+    case VOCTRL_GET_ANDROID_VIDEO_LAYER:
+        *(struct voctrl_android_video_layer *)data = (struct voctrl_android_video_layer){
+            .active = p->android_captions && p->last_id,
+            .w = p->osd_res.w,
+            .h = p->osd_res.h,
+            .render_id = p->last_id,
+            .osd_updates = mp_android_captions_updates(p->android_captions),
+        };
+        if (p->ra_ctx && p->ra_ctx->fns->control) {
+            int events = 0;
+            p->ra_ctx->fns->control(p->ra_ctx, &events, request, data);
+        }
+        return VO_TRUE;
+#endif
     case VOCTRL_PERFORMANCE_DATA: {
         struct voctrl_performance_data *perf = data;
         copy_frame_info_to_mp(&p->perf_fresh, &perf->fresh, &p->hwdec.perf, &p->sw_upload_perf);
@@ -2515,12 +2756,20 @@ done:
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+#if HAVE_EGL_ANDROID
+    mp_android_captions_destroy(&p->android_captions);
+#endif
 
     // Drain any in-flight uploads.
     if (p->gpu)
         pl_gpu_finish(p->gpu);
 
     pl_queue_destroy(&p->queue); // destroy this first
+#if HAVE_EGL_ANDROID
+    av_buffer_unref(&p->software_lut);
+    pl_shader_obj_destroy(&p->software_lut_state);
+    pl_dispatch_destroy(&p->software_lut_dispatch);
+#endif
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
     for (int i = 0; i < p->num_sub_tex; i++)
@@ -2592,6 +2841,7 @@ static int preinit(struct vo *vo)
     p->ra_ctx = p->context->ra_ctx;
     p->pllog = p->context->pllog;
     p->gpu = p->context->gpu;
+    if (p->ra_ctx) p->ra_ctx->pl_gpu = p->gpu;
     p->sw = p->context->swapchain;
     p->hwdec_ctx = (struct ra_hwdec_ctx) {
         .log = p->log,
@@ -2618,6 +2868,15 @@ static int preinit(struct vo *vo)
 
     p->pars = pl_options_alloc(p->pllog);
     update_render_options(vo);
+#if HAVE_EGL_ANDROID
+    if (vo->opts->android_video_layer) {
+        p->android_captions = mp_android_captions_create(vo, false);
+        if (!p->android_captions) {
+            MP_ERR(vo, "Independent video layer requires a caption Surface.\n");
+            goto err_out;
+        }
+    }
+#endif
     return 0;
 
 err_out:
@@ -2938,6 +3197,8 @@ static void update_render_options(struct vo *vo)
     // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
     // ratio of 1/2, but only if anti aliasing is enabled.
     int req_frames = 2;
+    if (vo->opts->android_color_lut && !pars->params.frame_mixer)
+        req_frames = 1;
     if (pars->params.frame_mixer) {
         req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
                       (pars->params.skip_anti_aliasing ? 1 : 2);

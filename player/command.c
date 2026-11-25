@@ -3164,12 +3164,14 @@ static int mp_property_android_native_dolby(void *ctx, struct m_property *prop,
     MPContext *mpctx = ctx;
     struct voctrl_android_native_dolby state = {0};
     bool hdr = !strcmp(prop->name, "android-native-hdr-status");
+    bool dolby = !strcmp(prop->name, "android-native-dolby-status");
+    struct mp_vo_opts *opts = mpctx->opts->vo;
     if (mpctx->video_out &&
-        (hdr ? mpctx->opts->vo->android_native_hdr != 0
-             : mpctx->opts->vo->android_native_dolby))
+        (hdr ? opts->android_native_hdr != 0
+             : dolby ? opts->android_native_dolby : opts->android_native_sdr))
         vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_NATIVE_DOLBY, &state);
     struct m_sub_property props[] = {
-        {"mel-conversion", SUB_PROP_BOOL(!hdr && mpctx->opts->vo->android_native_dolby_p7_mel)},
+        {"mel-conversion", SUB_PROP_BOOL(dolby && opts->android_native_dolby_p7_mel)},
         {"active", SUB_PROP_BOOL(state.active)},
         {"failed", SUB_PROP_BOOL(state.failed)},
         {"decoder-failed", SUB_PROP_BOOL(state.decoder_failed)},
@@ -3178,6 +3180,36 @@ static int mp_property_android_native_dolby(void *ctx, struct m_property *prop,
         {"base-layer-only", SUB_PROP_BOOL(hdr && mpctx->opts->vo->android_native_hdr_p7_base)},
         {"transfer", SUB_PROP_STR(hdr ? (mpctx->opts->vo->android_native_hdr == 18 ? "hlg" :
                                            mpctx->opts->vo->android_native_hdr == 16 ? "pq" : "no") : "dolby")},
+        {0}
+    };
+    return m_property_read_sub(props, action, arg);
+}
+
+static int mp_property_android_video_layer(void *ctx, struct m_property *prop,
+                                           int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct voctrl_android_video_layer state = {0};
+    if (mpctx->video_out && mpctx->opts->vo->android_video_layer)
+        vo_control(mpctx->video_out, VOCTRL_GET_ANDROID_VIDEO_LAYER, &state);
+    int fmt = mpctx->opts->vo->android_video_layer_format;
+    struct m_sub_property props[] = {
+        {"active", SUB_PROP_BOOL(state.active)},
+        {"w", SUB_PROP_INT(state.w)},
+        {"h", SUB_PROP_INT(state.h)},
+        {"render-id", SUB_PROP_INT64(state.render_id)},
+        {"latch-stats", SUB_PROP_BOOL(state.latch_stats)},
+        {"hdr-buffer-pool", SUB_PROP_BOOL(state.hdr_buffer_pool)},
+        {"submitted", SUB_PROP_INT64(state.submitted)},
+        {"completed", SUB_PROP_INT64(state.completed)},
+        {"unique-latches", SUB_PROP_INT64(state.unique_latches)},
+        {"merged-latches", SUB_PROP_INT64(state.merged_latches)},
+        {"invalid-latches", SUB_PROP_INT64(state.invalid_latches)},
+        {"osd-updates", SUB_PROP_INT64(state.osd_updates)},
+        {"format", SUB_PROP_STR(fmt == 2 ? "rgb10a2" : fmt == 1 ? "rgba8" : "nv21")},
+        // The actual HDMI/HWC state must still be verified separately.
+        {"hdr-requested", SUB_PROP_BOOL(mpctx->opts->vo->android_hdr_output)},
+        {"contiguous", SUB_PROP_BOOL(mpctx->opts->vo->android_video_layer_contiguous)},
         {0}
     };
     return m_property_read_sub(props, action, arg);
@@ -4851,6 +4883,8 @@ static const struct m_property mp_properties_base[] = {
     {"osd-dimensions", mp_property_osd_dim},
     {"android-native-dolby-status", mp_property_android_native_dolby},
     {"android-native-hdr-status", mp_property_android_native_dolby},
+    {"android-native-sdr-status", mp_property_android_native_dolby},
+    {"android-video-layer-status", mp_property_android_video_layer},
     M_PROPERTY_ALIAS("osd-width", "osd-dimensions/w"),
     M_PROPERTY_ALIAS("osd-height", "osd-dimensions/h"),
     M_PROPERTY_ALIAS("osd-par", "osd-dimensions/par"),

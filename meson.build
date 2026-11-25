@@ -265,6 +265,7 @@ sources = files(
     'video/sws_utils.c',
 
     ## libplacebo
+    'video/out/placebo/color_lut.c',
     'video/out/placebo/ra_pl.c',
     'video/out/placebo/utils.c',
     'video/out/vo_gpu_next.c',
@@ -1283,6 +1284,7 @@ if features['egl-android']
     dependencies += egl_android
     features += {'gl': true}
     sources += files('video/out/opengl/context_android.c',
+                     'video/out/opengl/android_video_layer.c',
                      'video/out/opengl/android_gl_trace.c')
 endif
 

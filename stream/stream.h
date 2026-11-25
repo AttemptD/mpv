@@ -76,6 +76,7 @@ enum stream_ctrl {
     STREAM_CTRL_AVSEEK,
     STREAM_CTRL_HAS_AVSEEK,
     STREAM_CTRL_GET_METADATA,
+    STREAM_CTRL_SET_SEEK_PREFETCH_BYPASS, // bool*, while positioning a demuxer
 
     // Optical discs (internal interface between streams and demux_disc)
     STREAM_CTRL_GET_TIME_LENGTH,
@@ -109,6 +110,7 @@ enum stream_ctrl {
     STREAM_CTRL_NAV_DRAIN_ACK,       // flush done, release the held EOF
     STREAM_CTRL_GET_STREAMS,         // struct stream_streams_req*
     STREAM_CTRL_GET_SEGMENTS,        // struct stream_segments_req*
+    STREAM_CTRL_SET_HEADER_PROBING,  // bool*, while reading container headers
 };
 
 // Fetch the still image that a disc (DVD-Audio ASVS) associates with the given

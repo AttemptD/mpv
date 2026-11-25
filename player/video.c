@@ -480,6 +480,11 @@ static void shift_frames(struct MPContext *mpctx)
 static bool use_video_lookahead(struct MPContext *mpctx)
 {
     return mpctx->video_out &&
+           // The opt-in Android LUT path has a fixed MediaCodec Surface pool.
+           // Avoid retaining a future frame, while preserving the normal
+           // first-frame render barrier used for audio/video startup sync.
+           !(mpctx->video_out->opts->android_color_lut &&
+             !mpctx->video_out->opts->android_dovi_dual) &&
            !(mpctx->video_out->driver->caps & VO_CAP_NORETAIN) &&
            !(mpctx->opts->untimed || (mpctx->video_out->driver->caps & VO_CAP_UNTIMED)) &&
            !mpctx->opts->video_latency_hacks;

@@ -509,12 +509,14 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     const char *codec = ctx->codec->codec;
 
     m_config_cache_update(ctx->hwdec_opts_cache);
+    ctx->force_eof = false;
 
     struct hwdec_info *hwdecs = NULL;
     int num_hwdecs = 0;
     add_all_hwdec_methods(&hwdecs, &num_hwdecs);
 
     char **hwdec_api = ctx->hwdec_opts->hwdec_api;
+    bool requested_hardware = false;
     for (int i = 0; hwdec_api && hwdec_api[i]; i++) {
         bstr opt = bstr0(hwdec_api[i]);
 
@@ -542,6 +544,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
             MP_VERBOSE(vd, "Not trying to use hardware decoding: disallowed\n");
             break;
         } else {
+            requested_hardware = true;
             bool hwdec_name_supported = false;  // relevant only if !hwdec_auto
             for (int n = 0; n < num_hwdecs; n++) {
                 struct hwdec_info *hwdec = &hwdecs[n];
@@ -646,7 +649,10 @@ static void select_and_set_hwdec(struct mp_filter *vd)
     } else {
         // If software fallback is disabled and we get here, all hwdec must
         // have failed. Tell the ctx to always force an eof.
-        if (ctx->hwdec_opts->software_fallback == INT_MAX) {
+        if (requested_hardware && ctx->vo && ctx->vo->opts->android_require_hwdec) {
+            MP_ERR(vd, "All requested hardware decoders failed; CPU fallback is disabled by TV policy.\n");
+            ctx->force_eof = true;
+        } else if (ctx->hwdec_opts->software_fallback == INT_MAX) {
             MP_WARN(ctx, "Software decoding fallback is disabled.\n");
             ctx->force_eof = true;
         } else {
@@ -686,10 +692,13 @@ static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
 static bool native_surface_requested(vd_ffmpeg_ctx *ctx)
 {
 #if HAVE_ANDROID
-    return ctx->vo && (ctx->vo->opts->android_native_dolby || ctx->vo->opts->android_native_hdr) &&
+    return ctx->vo &&
+        (ctx->vo->opts->android_native_dolby || ctx->vo->opts->android_native_hdr ||
+         ctx->vo->opts->android_native_sdr) &&
         (strcmp(ctx->vo->driver->name, "mediacodec_embed") == 0 ||
          strcmp(ctx->vo->driver->name, "android-native-dolby") == 0 ||
-         strcmp(ctx->vo->driver->name, "android-native-hdr") == 0);
+         strcmp(ctx->vo->driver->name, "android-native-hdr") == 0 ||
+         strcmp(ctx->vo->driver->name, "android-native-sdr") == 0);
 #else
     return false;
 #endif
@@ -879,6 +888,25 @@ static void init_avctx(struct mp_filter *vd)
         break;
     }
 
+#if HAVE_ANDROID
+    if (!ctx->use_hwdec && lavc_codec->id == AV_CODEC_ID_HEVC && ctx->vo &&
+        ctx->vo->opts->android_hevc_mc10) {
+        // Only the software HEVC decoder knows this option. Its SPS setup
+        // leaves 8/12-bit streams untouched, and explicit avopts below win.
+        if (av_opt_set_int(avctx, "mc10_neon", 1, AV_OPT_SEARCH_CHILDREN) < 0)
+            MP_WARN(vd, "Main10 NEON optimization unavailable; keeping default DSP.\n");
+        else
+            MP_VERBOSE(vd, "Enabled software HEVC Main10 NEON motion compensation.\n");
+    }
+    if (ctx->use_hwdec && !ctx->hwdec.copying &&
+        ctx->hwdec.pix_fmt == AV_PIX_FMT_MEDIACODEC) {
+        // This host renders/releases Surface slots asynchronously from decode.
+        // Permit it to service the VO when MediaCodec's external consumer is
+        // backpressured. Apply user avopts afterwards so an explicit override
+        // still takes precedence.
+        av_opt_set_int(avctx, "external_output_backpressure", 1, AV_OPT_SEARCH_CHILDREN);
+    }
+#endif
     mp_set_avopts(vd->log, avctx, lavc_param->avopts);
 
     // Do this after the above avopt handling in case it changes values
@@ -890,8 +918,20 @@ static void init_avctx(struct mp_filter *vd)
     }
 
 #if HAVE_ANDROID
-    if (native_surface && ctx->vo->opts->android_native_hdr) {
-        int transfer = ctx->vo->opts->android_native_hdr;
+    if (native_surface && ctx->vo->opts->android_native_sdr &&
+        (!ctx->use_hwdec || ctx->hwdec.copying ||
+         strcmp(lavc_codec->name, "h264_mediacodec") != 0 || c->dovi ||
+         c->color.transfer == PL_COLOR_TRC_PQ || c->color.transfer == PL_COLOR_TRC_HLG)) {
+        MP_ERR(vd, "Native SDR requires a compatible H.264 MediaCodec Surface.\n");
+        goto error;
+    }
+    bool gpu_p7_base = ctx->vo && !native_surface &&
+        ctx->vo->opts->android_native_hdr_p7_base &&
+        c->dovi && c->dv_profile == 7 && c->dv_bl_compatibility_id == 6 &&
+        ctx->use_hwdec &&
+        !strcmp(lavc_codec->name, "hevc_mediacodec");
+    if ((native_surface && ctx->vo->opts->android_native_hdr) || gpu_p7_base) {
+        int transfer = gpu_p7_base ? 16 : ctx->vo->opts->android_native_hdr;
         bool p7_base = ctx->vo->opts->android_native_hdr_p7_base &&
             c->dovi && c->dv_profile == 7 &&
             c->dv_bl_compatibility_id == 6 && transfer == 16;
@@ -900,7 +940,7 @@ static void init_avctx(struct mp_filter *vd)
         bool codec_ok = !strcmp(lavc_codec->name, "hevc_mediacodec") ||
                         !strcmp(lavc_codec->name, "vp9_mediacodec") ||
                         !strcmp(lavc_codec->name, "av1_mediacodec");
-        if (!ctx->use_hwdec || ctx->hwdec.copying || !codec_ok || !compatible ||
+        if (!ctx->use_hwdec || (ctx->hwdec.copying && !gpu_p7_base) || !codec_ok || !compatible ||
             av_opt_set_int(avctx, "native_hdr_output", transfer, AV_OPT_SEARCH_CHILDREN) < 0) {
             MP_ERR(vd, "Native HDR requires compatible PQ/HLG MediaCodec Surface decoding.\n");
             goto error;
@@ -919,18 +959,26 @@ static void init_avctx(struct mp_filter *vd)
             avctx->colorspace = AVCOL_SPC_BT2020_NCL;
             avctx->color_range = AVCOL_RANGE_MPEG;
         }
+        if (gpu_p7_base)
+            MP_INFO(vd, "P7 SDR compatibility: decoding the original HDR10 base; RPU/EL omitted.\n");
     }
     if (native_surface && ctx->vo->opts->android_native_dolby) {
         bool mel = ctx->vo->opts->android_native_dolby_p7_mel;
         if (!ctx->use_hwdec || ctx->hwdec.copying ||
             strcmp(lavc_codec->name, "hevc_mediacodec") != 0 ||
             (mel ? c->dv_profile != 7 || c->dv_bl_compatibility_id != 6
-                 : c->dv_profile != 5 && c->dv_profile != 8)) {
+                 : c->dv_profile != 5 && c->dv_profile != 8 &&
+                   !(c->dv_profile == 7 && c->dv_bl_compatibility_id == 6))) {
             MP_ERR(vd, "Native Dolby Vision requires P5/P8 or verified P7 MEL MediaCodec decoding.\n");
             goto error;
         }
         if (av_opt_set_int(avctx, "native_dolby_vision", 1, AV_OPT_SEARCH_CHILDREN) < 0) {
             MP_ERR(vd, "FFmpeg does not support native Dolby Vision Surface decoding.\n");
+            goto error;
+        }
+        if (ctx->vo->opts->android_native_dolby_hdr &&
+            av_opt_set_int(avctx, "native_dolby_hdr_output", 1, AV_OPT_SEARCH_CHILDREN) < 0) {
+            MP_ERR(vd, "FFmpeg cannot verify platform Dolby to HDR10 conversion.\n");
             goto error;
         }
         if (mel && av_opt_set_int(avctx, "native_dolby_p7_mel", 1,

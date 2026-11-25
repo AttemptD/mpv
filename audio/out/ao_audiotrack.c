@@ -100,6 +100,7 @@ static struct JNIAudioTrack {
     jmethodID getLatency;
     jmethodID getMinBufferSize;
     jmethodID getNativeOutputSampleRate;
+    jmethodID isDirectPlaybackSupported;
     jint STATE_INITIALIZED;
     jint PLAYSTATE_STOPPED;
     jint PLAYSTATE_PAUSED;
@@ -133,6 +134,8 @@ static const struct MPJniField AudioTrack_mapping[] = {
     {"getLatency", "()I", MP_JNI_METHOD, OFFSET(getLatency), 1},
     {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
     {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
+    {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z",
+        MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
     {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
     {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
     {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
@@ -235,14 +238,20 @@ static const struct MPJniField AudioFormatBuilder_mapping[] = {
 
 static struct JNIAudioManager {
     jclass clazz;
+    jmethodID getDirectPlaybackSupport;
     jint ERROR_DEAD_OBJECT;
     jint STREAM_MUSIC;
+    jint DIRECT_PLAYBACK_BITSTREAM_SUPPORTED;
 } AudioManager;
 #define OFFSET(member) offsetof(struct JNIAudioManager, member)
 static const struct MPJniField AudioManager_mapping[] = {
     {"android/media/AudioManager", NULL, MP_JNI_CLASS, OFFSET(clazz), 1},
     {"STREAM_MUSIC", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STREAM_MUSIC), 1},
     {"ERROR_DEAD_OBJECT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ERROR_DEAD_OBJECT), 0},
+    {"getDirectPlaybackSupport", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)I",
+        MP_JNI_STATIC_METHOD, OFFSET(getDirectPlaybackSupport), 0},
+    {"DIRECT_PLAYBACK_BITSTREAM_SUPPORTED", "I", MP_JNI_STATIC_FIELD_AS_INT,
+        OFFSET(DIRECT_PLAYBACK_BITSTREAM_SUPPORTED), 0},
     {0}
 };
 #undef OFFSET
@@ -312,6 +321,24 @@ static int AudioTrack_New(struct ao *ao)
         }
         jobject attr = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.build);
         MP_JNI_LOCAL_FREEP(&attr_builder);
+
+        if (p->format == AudioFormat.ENCODING_IEC61937) {
+            bool direct = true;
+            if (AudioManager.getDirectPlaybackSupport && AudioManager.DIRECT_PLAYBACK_BITSTREAM_SUPPORTED) {
+                jint modes = MP_JNI_CALL_STATIC_INT(AudioManager.clazz,
+                    AudioManager.getDirectPlaybackSupport, format, attr);
+                direct = modes & AudioManager.DIRECT_PLAYBACK_BITSTREAM_SUPPORTED;
+            } else if (AudioTrack.isDirectPlaybackSupported) {
+                direct = MP_JNI_DO(CallStaticBooleanMethod, AudioTrack.clazz,
+                    AudioTrack.isDirectPlaybackSupported, format, attr);
+            }
+            if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !direct) {
+                MP_JNI_LOCAL_FREEP(&format);
+                MP_JNI_LOCAL_FREEP(&attr);
+                MP_VERBOSE(ao, "IEC61937 is unavailable on the audio route\n");
+                return -1;
+            }
+        }
 
         audiotrack = MP_JNI_NEW(
             AudioTrack.clazz,
@@ -654,14 +681,17 @@ static int init(struct ao *ao)
     mp_mutex_init(&p->lock);
     mp_cond_init(&p->wakeup);
 
-    if (init_jni(ao) < 0)
+    if (init_jni(ao) < 0) {
+        mp_cond_destroy(&p->wakeup);
+        mp_mutex_destroy(&p->lock);
         return -1;
+    }
 
     if (af_fmt_is_spdif(ao->format)) {
         p->format = AudioFormat.ENCODING_IEC61937;
         if (!p->format || !AudioTrack.writeShortV23) {
             MP_ERR(ao, "spdif passthrough not supported by API\n");
-            return -1;
+            goto error;
         }
     } else if (ao->format == AF_FORMAT_U8) {
         p->format = AudioFormat.ENCODING_PCM_8BIT;
@@ -673,7 +703,9 @@ static int init(struct ao *ao)
         p->format = AudioFormat.ENCODING_PCM_16BIT;
     }
 
-    if (AudioTrack.getNativeOutputSampleRate) {
+    // The IEC carrier rate is part of the bitstream format. Resampling it
+    // to the PCM mixer's rate would invalidate E-AC3 and HBR bursts.
+    if (!af_fmt_is_spdif(ao->format) && AudioTrack.getNativeOutputSampleRate) {
         jint samplerate = MP_JNI_CALL_STATIC_INT(
             AudioTrack.clazz,
             AudioTrack.getNativeOutputSampleRate,
@@ -711,7 +743,10 @@ static int init(struct ao *ao)
     };
     static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
     if (p->format == AudioFormat.ENCODING_IEC61937) {
-        p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
+        p->channel_config = ao->channels.num == 8 ?
+            AudioFormat.CHANNEL_OUT_7POINT1_SURROUND : AudioFormat.CHANNEL_OUT_STEREO;
+        if (!p->channel_config || (ao->channels.num != 2 && ao->channels.num != 8))
+            goto error;
     } else {
         struct mp_chmap_sel sel = {0};
         for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
@@ -733,7 +768,7 @@ static int init(struct ao *ao)
     );
     if (MP_JNI_EXCEPTION_LOG(ao) < 0 || buffer_size <= 0) {
         MP_FATAL(ao, "AudioTrack.getMinBufferSize returned an invalid size: %d", buffer_size);
-        return -1;
+        goto error;
     }
 
     // Choose double of the minimum buffer size suggested by the driver, but not
@@ -741,12 +776,14 @@ static int init(struct ao *ao)
     const int bps = af_fmt_to_bytes(ao->format);
     int min = 0.075 * p->samplerate * bps * ao->channels.num;
     int max = min * 2;
-    min = MP_ALIGN_UP(min, bps);
-    max = MP_ALIGN_UP(max, bps);
-    p->size = MPCLAMP(buffer_size * 2, min, max);
+    const int frame_size = bps * ao->channels.num;
+    const int alignment = af_fmt_is_spdif(ao->format) ? frame_size : bps;
+    min = MP_ALIGN_UP(min, alignment);
+    max = MP_ALIGN_UP(max, alignment);
+    p->size = MP_ALIGN_UP(MPCLAMP(buffer_size * 2, min, max), alignment);
     MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
     mp_assert(p->size % bps == 0);
-    ao->device_buffer = p->size / bps;
+    ao->device_buffer = p->size / frame_size;
 
     p->chunksize = p->size;
     p->chunk = talloc_size(ao, p->size);
@@ -754,7 +791,7 @@ static int init(struct ao *ao)
     jobject timestamp = MP_JNI_NEW(AudioTimestamp.clazz, AudioTimestamp.ctor);
     if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !timestamp) {
         MP_FATAL(ao, "AudioTimestamp could not be created\n");
-        return -1;
+        goto error;
     }
     p->timestamp = (*env)->NewGlobalRef(env, timestamp);
     MP_JNI_LOCAL_FREEP(&timestamp);

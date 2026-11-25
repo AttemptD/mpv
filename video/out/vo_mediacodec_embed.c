@@ -21,12 +21,16 @@
 #include <android/native_window_jni.h>
 #include <string.h>
 
+#include "config.h"
 #include "common/common.h"
 #include "misc/jni.h"
 #include "sub/osd.h"
 #include "vo.h"
 #include "video/mp_image.h"
 #include "video/hwdec.h"
+#if HAVE_EGL_ANDROID
+#include "video/out/opengl/android_video_layer.h"
+#endif
 
 struct priv {
     struct mp_image *next_image;
@@ -35,6 +39,7 @@ struct priv {
     jobject video_surface;
     jmethodID geometry, visibility;
     ANativeWindow *captions;
+    struct mp_android_captions *caption_worker;
     struct mp_osd_res osd;
     int64_t osd_change;
     int64_t submitted, osd_updates;
@@ -96,6 +101,9 @@ static bool init_host(struct vo *vo)
     (*env)->DeleteLocalRef(env, surface);
     if (!java_ok(vo, env) || !p->video_surface || !p->captions)
         return false;
+#if HAVE_EGL_ANDROID
+    p->caption_worker = mp_android_captions_create(vo, true);
+#endif
     p->osd_change = -1;
     return true;
 }
@@ -126,9 +134,14 @@ static int preinit(struct vo *vo)
     if (!strcmp(vo->driver->name, "android-native-hdr") &&
         !vo->opts->android_native_hdr)
         return -1;
-    if (vo->opts->android_native_dolby && vo->opts->android_native_hdr)
+    if (!strcmp(vo->driver->name, "android-native-sdr") &&
+        !vo->opts->android_native_sdr)
         return -1;
-    if ((vo->opts->android_native_dolby || vo->opts->android_native_hdr) && !init_host(vo)) {
+    int native_modes = vo->opts->android_native_dolby +
+        (vo->opts->android_native_hdr != 0) + vo->opts->android_native_sdr;
+    if (native_modes > 1)
+        return -1;
+    if (native_modes && !init_host(vo)) {
         MP_ERR(vo, "Native output requires the video/caption Surface host.\n");
         return -1;
     }
@@ -167,7 +180,8 @@ static void update_geometry(struct vo *vo)
         src.x0, src.y0, src.x1, src.y1, dst.x0, dst.y0, dst.x1, dst.y1,
         vo->params->rotate, w, h, vo->params->w, vo->params->h);
     java_ok(vo, env);
-    if (ANativeWindow_setBuffersGeometry(p->captions, w, h, WINDOW_FORMAT_RGBA_8888) < 0)
+    if (!p->caption_worker &&
+        ANativeWindow_setBuffersGeometry(p->captions, w, h, WINDOW_FORMAT_RGBA_8888) < 0)
         p->failed = true;
     p->osd_change = -1;
     vo_event(vo, VO_EVENT_RESIZE);
@@ -180,6 +194,13 @@ static void draw_captions(struct vo *vo, double pts)
     struct priv *p = vo->priv;
     if (!p->captions || p->osd.w <= 0 || p->osd.h <= 0)
         return;
+#if HAVE_EGL_ANDROID
+    if (p->caption_worker) {
+        if (!mp_android_captions_draw(p->caption_worker, &p->osd, pts))
+            p->failed = true;
+        return;
+    }
+#endif
     const bool formats[SUBBITMAP_COUNT] = {[SUBBITMAP_BGRA] = true};
     struct sub_bitmap_list *list = osd_render(vo->osd, p->osd, pts, 0, formats);
     if (list->change_id == p->osd_change) {
@@ -295,15 +316,21 @@ static int control(struct vo *vo, uint32_t request, void *data)
         update_geometry(vo);
         vo->want_redraw = true;
         return VO_TRUE;
-    case VOCTRL_GET_ANDROID_NATIVE_DOLBY:
+    case VOCTRL_GET_ANDROID_NATIVE_DOLBY: {
+        int64_t osd_updates = p->osd_updates;
+#if HAVE_EGL_ANDROID
+        if (p->caption_worker)
+            osd_updates = mp_android_captions_updates(p->caption_worker);
+#endif
         *(struct voctrl_android_native_dolby *)data = (struct voctrl_android_native_dolby){
             .active = p->host && p->submitted > 0 && !p->failed && !p->decoder_failed,
             .failed = p->failed,
             .decoder_failed = p->decoder_failed,
             .frames = p->submitted,
-            .osd_updates = p->osd_updates,
+            .osd_updates = osd_updates,
         };
         return VO_TRUE;
+    }
     case VOCTRL_RESET:
         mp_image_unrefp(&p->next_image);
         p->last_pts = MP_NOPTS_VALUE;
@@ -315,6 +342,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
 static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
+    if (vo->opts->android_native_sdr &&
+        (params->color.transfer == PL_COLOR_TRC_PQ || params->color.transfer == PL_COLOR_TRC_HLG ||
+         params->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION)) {
+        ((struct priv *)vo->priv)->decoder_failed = true;
+        MP_ERR(vo, "Native SDR received an HDR frame.\n");
+        return -1;
+    }
     update_geometry(vo);
     return 0;
 }
@@ -323,6 +357,9 @@ static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
     visible(vo, false);
+#if HAVE_EGL_ANDROID
+    mp_android_captions_destroy(&p->caption_worker);
+#endif
     mp_image_unrefp(&p->next_image);
     if (vo->hwdec_devs && p->hwctx.av_device_ref)
         hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
@@ -367,6 +404,20 @@ const struct vo_driver video_out_android_native_dolby = {
 const struct vo_driver video_out_android_native_hdr = {
     .description = "Android native HDR10/HLG with a separate caption Surface",
     .name = "android-native-hdr",
+    .caps = VO_CAP_NORETAIN | VO_CAP_ROTATE90,
+    .preinit = preinit,
+    .query_format = query_format,
+    .control = control,
+    .draw_frame = draw_frame,
+    .flip_page = flip_page,
+    .reconfig = reconfig,
+    .uninit = uninit,
+    .priv_size = sizeof(struct priv),
+};
+
+const struct vo_driver video_out_android_native_sdr = {
+    .description = "Android native SDR with a separate caption Surface",
+    .name = "android-native-sdr",
     .caps = VO_CAP_NORETAIN | VO_CAP_ROTATE90,
     .preinit = preinit,
     .query_format = query_format,

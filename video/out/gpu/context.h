@@ -22,6 +22,7 @@ extern const struct m_sub_options ra_ctx_conf;
 struct ra_ctx {
     struct vo *vo;
     struct ra *ra;
+    const struct pl_gpu_t *pl_gpu; // Borrowed from gpu-next for hardware interop.
     struct mpv_global *global;
     struct mp_log *log;
 

@@ -274,6 +274,7 @@ void reset_playback_state(struct MPContext *mpctx)
     mpctx->ab_loop_clip = true;
     mpctx->restart_complete = false;
     mpctx->paused_for_cache = false;
+    mpctx->cache_resuming_seek = false;
     mpctx->cache_buffer = 100;
     mpctx->cache_update_pts = MP_NOPTS_VALUE;
 
@@ -430,6 +431,9 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
         clear_audio_output_buffers(mpctx);
 
     reset_playback_state(mpctx);
+    mpctx->cache_resuming_seek = mpctx->playing_msg_shown &&
+                                 mpctx->demuxer->is_network &&
+                                 (seek.type == MPSEEK_ABSOLUTE || seek.type == MPSEEK_RELATIVE);
 
     demux_block_reading(mpctx->demuxer, false);
     for (int t = 0; t < mpctx->num_tracks; t++) {
@@ -763,8 +767,16 @@ static void handle_update_cache(struct MPContext *mpctx)
                                      mpctx->audio_status == STATUS_READY);
     }
 
+    // A seek can complete its decoder restart while still waiting for the
+    // first network buffer. Use the seek threshold until playback resumes.
+    if (mpctx->restart_complete && !mpctx->paused_for_cache)
+        mpctx->cache_resuming_seek = false;
+    double cache_wait = opts->cache_pause_wait;
+    if (mpctx->cache_resuming_seek && opts->cache_pause_seek_wait >= 0)
+        cache_wait = MPMIN(cache_wait, opts->cache_pause_seek_wait);
+
     bool is_low = use_pause_on_low_cache && !s.idle &&
-                  s.ts_info.duration < opts->cache_pause_wait;
+                  s.ts_info.duration < cache_wait;
 
     // Enter buffering state only if there actually was an underrun (or if
     // initial caching before playback restart is used).
@@ -804,7 +816,7 @@ static void handle_update_cache(struct MPContext *mpctx)
 
     if (mpctx->paused_for_cache) {
         cache_buffer =
-            100 * MPCLAMP(s.ts_info.duration / opts->cache_pause_wait, 0, 0.99);
+            100 * MPCLAMP(s.ts_info.duration / cache_wait, 0, 0.99);
         mp_set_timeout(mpctx, 0.2);
     }
 

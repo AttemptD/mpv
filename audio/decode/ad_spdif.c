@@ -471,7 +471,7 @@ struct mp_decoder_list *select_spdif_codec(const char *codec, const char *pref)
 {
     struct mp_decoder_list *list = talloc_zero(NULL, struct mp_decoder_list);
 
-    if (!find_codec(codec))
+    if (!find_codec(codec) || !av_guess_format("spdif", NULL, NULL))
         return list;
 
     bool spdif_allowed = false, dts_hd_allowed = false;

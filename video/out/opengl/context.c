@@ -182,6 +182,12 @@ void ra_gl_ctx_resize(struct ra_swapchain *sw, int w, int h, int fbo)
     p->wrapped_fb = ra_create_wrapped_fb(sw->ctx->ra, fbo, w, h);
 }
 
+int ra_gl_ctx_main_fbo(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    return p->main_fb;
+}
+
 int ra_gl_ctx_color_depth(struct ra_swapchain *sw)
 {
     struct priv *p = sw->priv;
