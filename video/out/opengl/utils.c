@@ -32,7 +32,7 @@
 #include "utils.h"
 
 // GLU has this as gluErrorString (we don't use GLU, as it is legacy-OpenGL)
-static const char *gl_error_to_string(GLenum error)
+const char *gl_error_to_string(GLenum error)
 {
     switch (error) {
     case GL_INVALID_ENUM: return "INVALID_ENUM";
@@ -50,8 +50,8 @@ void gl_check_error(GL *gl, struct mp_log *log, const char *info)
         GLenum error = gl->GetError();
         if (error == GL_NO_ERROR)
             break;
-        mp_msg(log, MSGL_ERR, "%s: OpenGL error %s.\n", info,
-               gl_error_to_string(error));
+        mp_msg(log, MSGL_ERR, "%s: OpenGL error %s (0x%04x).\n", info,
+               gl_error_to_string(error), error);
     }
 }
 

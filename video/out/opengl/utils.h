@@ -26,6 +26,7 @@
 
 struct mp_log;
 
+const char *gl_error_to_string(GLenum error);
 void gl_check_error(GL *gl, struct mp_log *log, const char *info);
 
 void gl_upload_tex(GL *gl, GLenum target, GLenum format, GLenum type,

@@ -364,7 +364,10 @@ static struct ra_tex *gl_tex_create(struct ra *ra,
 
     gl->BindTexture(tex_gl->target, 0);
 
-    gl_check_error(gl, ra->log, "after creating texture");
+    gl_check_error(gl, ra->log, mp_tprintf(144,
+        "texture allocation size=%dx%dx%d format=%s target=0x%x render_target=%d",
+        params->w, params->h, params->d, params->format->name,
+        tex_gl->target, params->render_dst));
 
     // Even blitting needs an FBO in OpenGL for strange reasons.
     // Download is handled by reading from an FBO.
@@ -388,8 +391,9 @@ static struct ra_tex *gl_tex_create(struct ra *ra,
         gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
 
         if (err != GL_FRAMEBUFFER_COMPLETE) {
-            MP_ERR(ra, "Error: framebuffer completeness check failed (error=%d).\n",
-                   (int)err);
+            MP_ERR(ra, "glCheckFramebufferStatus returned 0x%04x: framebuffer=%u texture=%u size=%dx%d format=%s.\n",
+                   err, tex_gl->fbo, tex_gl->texture, params->w, params->h,
+                   params->format->name);
             ra_tex_free(ra, &tex);
             return NULL;
         }

@@ -19,6 +19,7 @@
 #include <EGL/eglext.h>
 
 #include "video/out/android_common.h"
+#include "android_gl_trace.h"
 #include "egl_helpers.h"
 #include "common/common.h"
 #include "context.h"
@@ -28,6 +29,8 @@ struct priv {
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
+    struct android_gl_trace *trace;
+    EGLint last_swap_error;
     bool hdr_active;
 };
 
@@ -72,13 +75,23 @@ static bool android_set_color(struct ra_ctx *ctx, struct mp_image_params *params
 static void android_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    eglSwapBuffers(p->egl_display, p->egl_surface);
+    if (eglSwapBuffers(p->egl_display, p->egl_surface)) {
+        p->last_swap_error = EGL_SUCCESS;
+    } else {
+        EGLint error = eglGetError();
+        if (error != p->last_swap_error) {
+            MP_ERR(ctx, "eglSwapBuffers failed: EGL error 0x%04x, surface=%dx%d.\n",
+                   (unsigned)error, ctx->vo->dwidth, ctx->vo->dheight);
+            p->last_swap_error = error;
+        }
+    }
 }
 
 static void android_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
     ra_gl_ctx_uninit(ctx);
+    android_gl_trace_destroy(p->trace);
 
     if (p->egl_surface) {
         eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
@@ -100,7 +113,7 @@ static bool android_init(struct ra_ctx *ctx)
 
     p->egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (!eglInitialize(p->egl_display, NULL, NULL)) {
-        MP_FATAL(ctx, "EGL failed to initialize.\n");
+        MP_FATAL(ctx, "eglInitialize failed: EGL error 0x%04x.\n", (unsigned)eglGetError());
         goto fail;
     }
 
@@ -139,14 +152,16 @@ static bool android_init(struct ra_ctx *ctx)
         (EGLNativeWindowType)native_window, use_hdr ? hdr_attribs : NULL);
 
     if (p->egl_surface == EGL_NO_SURFACE && use_hdr) {
-        MP_WARN(ctx, "Could not create BT.2020/PQ EGL surface; falling back to SDR.\n");
+        MP_WARN(ctx, "eglCreateWindowSurface failed for BT.2020/PQ: EGL error 0x%04x. Retrying SDR.\n",
+                (unsigned)eglGetError());
         p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
             (EGLNativeWindowType)native_window, NULL);
         use_hdr = false;
     }
 
     if (p->egl_surface == EGL_NO_SURFACE) {
-        MP_FATAL(ctx, "Could not create EGL surface!\n");
+        MP_FATAL(ctx, "eglCreateWindowSurface failed: EGL error 0x%04x, color=%d/%d/%d-bit.\n",
+                 (unsigned)eglGetError(), red_size, green_size, blue_size);
         goto fail;
     }
 
@@ -157,11 +172,16 @@ static bool android_init(struct ra_ctx *ctx)
 
     if (!eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface,
                         p->egl_context)) {
-        MP_FATAL(ctx, "Failed to set context!\n");
+        MP_FATAL(ctx, "eglMakeCurrent failed: EGL error 0x%04x.\n", (unsigned)eglGetError());
         goto fail;
     }
 
-    mpegl_load_functions(&p->gl, ctx->log);
+    if (ctx->vo->opts->android_gl_trace)
+        p->trace = android_gl_trace_create(p, ctx->log);
+    if (p->trace)
+        mpegl_load_functions_cb(&p->gl, ctx->log, android_gl_trace_get_proc_address, p->trace);
+    else
+        mpegl_load_functions(&p->gl, ctx->log);
 
     struct ra_ctx_params params = {
         .preferred_csp = android_preferred_csp,

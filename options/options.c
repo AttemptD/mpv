@@ -253,6 +253,7 @@ static const m_option_t mp_vo_opt_list[] = {
         {"roundsmall", DWMWCP_ROUNDSMALL})},
 #endif
 #if HAVE_EGL_ANDROID
+    {"android-gl-trace", OPT_BOOL(android_gl_trace)},
     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
     {"android-hdr-output", OPT_BOOL(android_hdr_output)},
     {"android-dovi-yuv", OPT_BOOL(android_dovi_yuv)},

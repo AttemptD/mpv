@@ -35,6 +35,9 @@
 #include "options/options.h"
 #include "video/out/vo.h"
 #include "video/out/gpu/hwdec.h"
+#if HAVE_EGL_ANDROID
+#include "video/out/opengl/android_gl_trace.h"
+#endif
 #include "video/out/opengl/ra_gl.h"
 #include "android_yuv_shaders.h"
 
@@ -589,6 +592,11 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
         (void *)eglGetProcAddress("eglGetNativeClientBufferANDROID");
     p->EGLImageTargetTexture2DOES =
         (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+#if HAVE_EGL_ANDROID
+    if (mapper->owner->ra_ctx->vo->opts->android_gl_trace)
+        p->EGLImageTargetTexture2DOES =
+            android_gl_trace_get_proc_address(NULL, "glEGLImageTargetTexture2DOES");
+#endif
 
     if (!p->CreateImageKHR || !p->DestroyImageKHR ||
         !p->GetNativeClientBufferANDROID || !p->EGLImageTargetTexture2DOES)
@@ -946,6 +954,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
 
     EGLClientBuffer buf = p->GetNativeClientBufferANDROID(hwbuf);
     if (!buf) {
+        MP_ERR(mapper, "eglGetNativeClientBufferANDROID failed: EGL error 0x%04x, buffer=%ux%u stride=%u format=0x%x.\n",
+               (unsigned)eglGetError(), d.width, d.height, d.stride, d.format);
         o->AImage_delete(next_image);
         return -1;
     }
@@ -954,6 +964,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     EGLImageKHR next_egl_image = p->CreateImageKHR(eglGetCurrentDisplay(),
         EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, buf, attribs);
     if (!next_egl_image) {
+        MP_ERR(mapper, "eglCreateImageKHR failed: EGL error 0x%04x, buffer=%ux%u stride=%u format=0x%x.\n",
+               (unsigned)eglGetError(), d.width, d.height, d.stride, d.format);
         o->AImage_delete(next_image);
         return -1;
     }

@@ -1282,7 +1282,8 @@ features += {'egl-android': egl_android.found()}
 if features['egl-android']
     dependencies += egl_android
     features += {'gl': true}
-    sources += files('video/out/opengl/context_android.c')
+    sources += files('video/out/opengl/context_android.c',
+                     'video/out/opengl/android_gl_trace.c')
 endif
 
 egl_drm = get_option('egl-drm').require(

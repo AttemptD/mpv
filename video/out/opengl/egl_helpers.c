@@ -345,16 +345,22 @@ static int GLAPIENTRY swap_interval(int interval)
 
 // Load gl version and function pointers into *gl.
 // Expects a current EGL context set.
-void mpegl_load_functions(struct GL *gl, struct mp_log *log)
+void mpegl_load_functions_cb(struct GL *gl, struct mp_log *log,
+                            void *(*get_proc)(void *, const char *), void *data)
 {
     const char *egl_exts = "";
     EGLDisplay display = eglGetCurrentDisplay();
     if (display != EGL_NO_DISPLAY)
         egl_exts = eglQueryString(display, EGL_EXTENSIONS);
 
-    mpgl_load_functions2(gl, mpegl_get_proc_address, NULL, egl_exts, log);
+    mpgl_load_functions2(gl, get_proc, data, egl_exts, log);
     if (!gl->SwapInterval)
         gl->SwapInterval = swap_interval;
+}
+
+void mpegl_load_functions(struct GL *gl, struct mp_log *log)
+{
+    mpegl_load_functions_cb(gl, log, mpegl_get_proc_address, NULL);
 }
 
 static bool is_egl15(void)

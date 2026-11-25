@@ -85,6 +85,7 @@ typedef struct mp_vo_opts {
     double timing_offset;
     int video_sync;
 
+    bool android_gl_trace;
     struct m_geometry android_surface_size;
     bool android_hdr_output;
     bool android_native_dolby;
