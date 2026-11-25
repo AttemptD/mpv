@@ -132,7 +132,8 @@ struct bd_overlay_plane {
 struct bluray_priv_s {
     BLURAY *bd;
     struct mp_log *bluray_log;
-    bool probing;               // open is an .iso auto-detection probe
+    bool probing;               // opening a candidate disc image
+    bool borrowed_input;        // the caller owns the byte stream until open succeeds
     BLURAY_TITLE_INFO *title_info;
     int num_titles;
     int current_angle;
@@ -805,7 +806,8 @@ static void bluray_priv_close(stream_t *s, struct bluray_priv_s *priv)
     if (priv->iso_stream) {
         MP_INFO(s, "Remote ISO cache: %"PRIu64" hits, %"PRIu64" misses\n",
                 priv->iso_cache_hits, priv->iso_cache_misses);
-        free_stream(priv->iso_stream);
+        if (!priv->borrowed_input)
+            free_stream(priv->iso_stream);
         priv->iso_stream = NULL;
     }
     mp_mutex_destroy(&priv->overlay_lock);
@@ -1732,33 +1734,38 @@ static int bluray_stream_open_internal(stream_t *s)
     }
 
     char *device_tmp = mp_get_user_path(NULL, s->global, device);
-    bool remote = is_remote_url(device_tmp);
+    bool remote = b->iso_stream ? b->iso_stream->is_network || b->iso_stream->streaming
+                                : is_remote_url(device_tmp);
     int opened;
-    if (remote) {
+    if (b->iso_stream || remote) {
         int cache_flag = b->opts->remote_cache_size > 0 ? STREAM_NO_SEEK_CACHE : 0;
-        b->iso_stream = stream_create(device_tmp, STREAM_READ | s->stream_origin | cache_flag,
-                                      s->cancel, s->global);
+        if (!b->iso_stream) {
+            b->iso_stream = stream_create(device_tmp, STREAM_READ | s->stream_origin | cache_flag,
+                                          s->cancel, s->global);
+        }
         talloc_free(device_tmp);
         if (!b->iso_stream) {
             MP_ERR(s, "Couldn't open remote stream: %s\n", device);
             ret = STREAM_UNSUPPORTED;
             goto err;
         }
-        b->iso_cache_entries = b->opts->remote_cache_size / BLURAY_REMOTE_CHUNK_SIZE;
+        b->iso_cache_entries = remote
+            ? b->opts->remote_cache_size / BLURAY_REMOTE_CHUNK_SIZE : 0;
         if (b->iso_cache_entries) {
             b->iso_cache = talloc_zero_array(b, struct bluray_remote_cache_entry,
                                              b->iso_cache_entries);
             if (!b->iso_cache)
                 b->iso_cache_entries = 0;
         }
-        b->remote_fast_mode = b->opts->remote_fast_open &&
+        b->remote_fast_mode = remote && b->opts->remote_fast_open &&
             (b->cfg_title == BLURAY_DEFAULT_TITLE ||
              b->cfg_title == BLURAY_PLAYLIST_TITLE);
-        MP_INFO(s, "Opening remote Blu-ray ISO (block cache: %d MiB; fast open: %s)\n",
+        MP_INFO(s, "Opening Blu-ray/DVD ISO (block cache: %d MiB; fast open: %s)\n",
                 b->iso_cache_entries, b->remote_fast_mode ? "yes" : "no");
-        bd_proxy_prefetch_metadata(s, b);
+        if (remote)
+            bd_proxy_prefetch_metadata(s, b);
         opened = bd_open_stream(bd, b, bd_proxy_read_blocks);
-        if (!opened) {
+        if (!opened || !bd_get_disc_info(bd)->bluray_detected) {
             MP_VERBOSE(s, "Remote image is not Blu-ray; probing DVD-Video: %s\n",
                        device);
 #if HAVE_DVDNAV
@@ -1776,10 +1783,7 @@ static int bluray_stream_open_internal(stream_t *s)
         talloc_free(keyfile);
 #if HAVE_DVDNAV
         if (!opened && !b->probing) {
-            // Explicit bd:// is also the app's entry point for local ISOs.
-            // Read image bytes directly, without recursively probing the same
-            // .iso as another disc stream. Automatic file probing can still
-            // continue to the ordinary ifo_dvdnav handler as before.
+            // Preserve explicit bd:// access to local DVD images.
             b->iso_stream = stream_create(device_tmp,
                 STREAM_READ | STREAM_LOCAL_FS_ONLY | s->stream_origin,
                 s->cancel, s->global);
@@ -1946,10 +1950,25 @@ err:
     return ret;
 }
 
-static int bluray_stream_open(stream_t *s)
+struct bluray_image_probe {
+    struct stream *input;
+    struct bluray_priv_s *reader;
+};
+
+static int bluray_stream_open(stream_t *s, const struct stream_open_args *args)
 {
     struct bluray_priv_s *b = talloc_zero(s, struct bluray_priv_s);
     s->priv = b;
+    struct bluray_image_probe *probe = args->special_arg;
+    if (probe) {
+        s->log = mp_log_new(s, probe->input->log, "/disc-image");
+        probe->reader = b;
+        b->iso_stream = probe->input;
+        b->borrowed_input = true;
+        b->probing = true;
+        b->cfg_device = talloc_strdup(b, probe->input->url);
+        s->url = talloc_strdup(s, probe->input->url);
+    }
 
     bstr title, bdevice, rest = { .len = 0 };
     bstr_split_tok(bstr0(s->path), "/", &title, &bdevice);
@@ -1995,17 +2014,77 @@ static int bluray_stream_open(stream_t *s)
         b->cfg_title = t;
     }
 
-    b->cfg_device = bstrto0(b, bdevice);
+    if (!probe)
+        b->cfg_device = bstrto0(b, bdevice);
 
     return bluray_stream_open_internal(s);
 }
 
 const stream_info_t stream_info_bluray = {
     .name = "bd",
-    .open = bluray_stream_open,
+    .open2 = bluray_stream_open,
     .protocols = (const char*const[]){ "bd", "br", "bluray", NULL },
     .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
+
+static bool has_disc_image_descriptor(struct stream *s)
+{
+    // ISO 9660 and UDF place volume recognition descriptors after the 32 KiB
+    // system area. Peek into the existing buffer so ordinary media can reuse
+    // these bytes, and require the disc readers to verify the actual layout.
+    enum { sector_size = 2048, first_sector = 16, last_sector = 31 };
+    uint8_t prefix[last_sector * sector_size + 7];
+    int size = stream_read_peek(s, prefix, sizeof(prefix));
+    bool udf_sequence = false;
+    for (int offset = first_sector * sector_size; offset + 7 <= size;
+         offset += sector_size)
+    {
+        const uint8_t *descriptor = prefix + offset;
+        if (descriptor[6] != 1)
+            continue;
+        if (descriptor[0] == 1 && !memcmp(descriptor + 1, "CD001", 5))
+            return true;
+        if (descriptor[0] != 0)
+            continue;
+        if (!memcmp(descriptor + 1, "BEA01", 5))
+            udf_sequence = true;
+        if (udf_sequence && (!memcmp(descriptor + 1, "NSR02", 5) ||
+                             !memcmp(descriptor + 1, "NSR03", 5)))
+            return true;
+        if (!memcmp(descriptor + 1, "TEA01", 5))
+            udf_sequence = false;
+    }
+    return false;
+}
+
+struct stream *stream_open_disc_image(struct stream *input, int origin)
+{
+    if (origin != STREAM_ORIGIN_DIRECT || !input->access_references ||
+        !input->seekable || input->is_directory || input->demuxer ||
+        stream_tell(input) != 0 || !has_disc_image_descriptor(input))
+        return input;
+
+    struct bluray_image_probe probe = {.input = input};
+    struct stream_open_args args = {
+        .url = "bd://",
+        .global = input->global,
+        .cancel = input->cancel,
+        .flags = origin | STREAM_SILENT,
+        .sinfo = &stream_info_bluray,
+        .special_arg = &probe,
+    };
+    struct stream *disc;
+    // Keep the original stream usable if this is a data ISO or the disc
+    // reader cannot open it. Only hand off ownership after a complete open.
+    if (stream_create_with_args(&args, &disc) != STREAM_OK) {
+        stream_seek(input, 0);
+        return input;
+    }
+    probe.reader->borrowed_input = false;
+    disc->is_network = input->is_network;
+    disc->server_filename = talloc_strdup(disc, input->server_filename);
+    return disc;
+}
 
 static bool check_bdmv(const char *path)
 {
@@ -2065,21 +2144,6 @@ static int bdmv_dir_stream_open(stream_t *stream)
     char *path = mp_file_get_path(priv, bstr0(stream->url));
     if (!path)
         goto unsupported;
-
-    // Hand the .iso to libbluray as the device. Opening validates the disc
-    // info, so it doubles as the probe (see priv->probing).
-    if (bstr_case_endswith(bstr0(path), bstr0(".iso"))) {
-        priv->cfg_device = talloc_strdup(priv, path);
-        priv->probing = stream->autoprobed;
-        int r = bluray_stream_open_internal(stream);
-        if (r != STREAM_OK) {
-            if (priv->probing)
-                goto unsupported;
-            return r;
-        }
-        MP_INFO(stream, "Blu-ray ISO image detected. Redirecting to bluray://\n");
-        return r;
-    }
 
     // We allow the path to point to a directory containing BDMV/, a
     // directory containing MovieObject.bdmv, or that file itself.

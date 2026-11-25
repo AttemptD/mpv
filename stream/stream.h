@@ -429,6 +429,9 @@ void mp_url_unescape_inplace(char *buf);
 char *mp_url_unescape(void *talloc_ctx, const char *url);
 char *mp_url_escape(void *talloc_ctx, const char *s, const char *ok);
 
+// stream_bluray.c
+struct stream *stream_open_disc_image(struct stream *input, int origin);
+
 // stream_memory.c
 struct stream *stream_memory_open(struct mpv_global *global, void *data, int len);
 

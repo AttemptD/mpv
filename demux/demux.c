@@ -3773,6 +3773,11 @@ struct demuxer *demux_open_url(const char *url,
     if (!s) {
         s = stream_create(url, STREAM_READ | params->stream_flags,
                           priv_cancel, global);
+#if HAVE_LIBBLURAY
+        if (s && params->is_top_level && !params->init_fragment.len &&
+            (!params->force_format || !params->force_format[0]))
+            s = stream_open_disc_image(s, params->stream_flags & STREAM_ORIGIN_MASK);
+#endif
         if (s && params->init_fragment.len) {
             s = create_webshit_concat_stream(global, priv_cancel,
                                              params->init_fragment, s);

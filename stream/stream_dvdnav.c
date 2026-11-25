@@ -1795,6 +1795,8 @@ static int ifo_dvdnav_stream_open(stream_t *stream)
     if (!path)
         goto unsupported;
 
+#if !HAVE_LIBBLURAY
+    // DVD-only builds still use the local libdvdnav image entry point.
     // Hand the .iso to libdvdnav as the device. Opening validates the VMG
     // IFO, so it doubles as the probe (see priv->probing).
     if (bstr_case_endswith(bstr0(path), bstr0(".iso"))) {
@@ -1809,6 +1811,8 @@ static int ifo_dvdnav_stream_open(stream_t *stream)
         MP_INFO(stream, "DVD ISO image detected. Redirecting to dvd://\n");
         return r;
     }
+
+#endif
 
     // We allow the path to point to a directory containing VIDEO_TS/, a
     // directory containing VIDEO_TS.IFO, or that file itself.
